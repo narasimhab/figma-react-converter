@@ -101,6 +101,72 @@ async function loadAllFonts() {
   await figma.loadFontAsync({ family: "Inter", style: "Regular" });
 }
 
+// ----- FontAwesome support -----
+// Map captured ::before font-family / font-weight to the Figma font that
+// actually exists on the user's machine. We probe each style once and cache
+// what's available so the renderer can degrade gracefully.
+const FA_FAMILY_CANDIDATES = [
+  "Font Awesome 6 Free",
+  "Font Awesome 6 Pro",
+  "Font Awesome 6 Brands",
+  "Font Awesome 5 Free",
+  "Font Awesome 5 Brands",
+  "FontAwesome",
+];
+const FA_STYLE_CANDIDATES = ["Solid", "Regular", "Light", "Thin", "Brands"];
+
+let _faFontsPromise = null;
+const _faAvailable = {};
+
+async function loadFontAwesomeFonts() {
+  if (_faFontsPromise) return _faFontsPromise;
+  _faFontsPromise = (async () => {
+    for (const family of FA_FAMILY_CANDIDATES) {
+      for (const style of FA_STYLE_CANDIDATES) {
+        try {
+          await figma.loadFontAsync({ family, style });
+          if (!_faAvailable[family]) _faAvailable[family] = [];
+          _faAvailable[family].push(style);
+        } catch (e) { /* font/style not installed */ }
+      }
+    }
+    return _faAvailable;
+  })();
+  return _faFontsPromise;
+}
+
+function pickFontAwesomeFont(capturedFamily, capturedWeight) {
+  const fam = String(capturedFamily || "").toLowerCase();
+  const weight = String(capturedWeight || "").toLowerCase();
+  const isBrands = fam.includes("brands");
+  const wantRegular = weight === "400" || weight === "normal" || fam.includes("regular");
+  const wantLight = weight === "300" || fam.includes("light");
+  const wantThin = weight === "100" || fam.includes("thin");
+
+  const familyOrder = isBrands
+    ? ["Font Awesome 6 Brands", "Font Awesome 5 Brands"]
+    : [
+        "Font Awesome 6 Free",
+        "Font Awesome 6 Pro",
+        "Font Awesome 5 Free",
+        "FontAwesome",
+      ];
+
+  let preferredStyle = "Solid";
+  if (isBrands) preferredStyle = "Brands";
+  else if (wantThin) preferredStyle = "Thin";
+  else if (wantLight) preferredStyle = "Light";
+  else if (wantRegular) preferredStyle = "Regular";
+
+  for (const family of familyOrder) {
+    const styles = _faAvailable[family];
+    if (!styles || !styles.length) continue;
+    const style = styles.indexOf(preferredStyle) >= 0 ? preferredStyle : styles[0];
+    return { family, style };
+  }
+  return null;
+}
+
 function setFill(node, color) {
   if (!color || !("fills" in node)) return;
   node.fills = [{
@@ -352,18 +418,49 @@ async function renderInput(parent, atom) {
 }
 
 async function renderIcon(parent, atom) {
+  // Primary path: we captured the FontAwesome glyph from ::before, so render
+  // it as real text using the matching FA font if installed.
+  if (atom.glyph) {
+    const picked = pickFontAwesomeFont(atom.fontFamily, atom.fontWeight);
+    if (picked) {
+      try {
+        const txt = figma.createText();
+        txt.fontName = { family: picked.family, style: picked.style };
+        txt.fontSize = Math.max(8, Math.round(atom.fontSize || Math.min(atom.w, atom.h) || 16));
+        txt.characters = atom.glyph;
+        const color = parseCssColor(atom.color) || { r: 0.39, g: 0.45, b: 0.55, a: 1 };
+        txt.fills = [{
+          type: "SOLID",
+          color: { r: color.r, g: color.g, b: color.b },
+          opacity: color.a === undefined ? 1 : color.a,
+        }];
+        txt.name = "icon " + (atom.classNames || "").trim();
+        txt.x = Math.round(atom.x);
+        txt.y = Math.round(atom.y);
+        parent.appendChild(txt);
+        return txt;
+      } catch (e) {
+        // Font loaded but the glyph isn't in this style (or another edge case)
+        // — fall through to the placeholder.
+      }
+    }
+  }
+
+  // Fallback: rounded square placeholder when no FA font is available.
+  // Keeps position + color so layout stays intact and the user can swap icons
+  // in Figma later.
   const dot = figma.createFrame();
-  dot.name = "icon";
+  dot.name = "icon " + ((atom.classNames || "").trim() || atom.tag || "");
   dot.x = Math.round(atom.x);
   dot.y = Math.round(atom.y);
   const size = Math.min(atom.w, atom.h) || 16;
   dot.resize(Math.max(8, Math.round(size)), Math.max(8, Math.round(size)));
-  dot.cornerRadius = 3;
+  dot.cornerRadius = Math.round(size / 2);
   const color = parseCssColor(atom.color) || { r: 0.39, g: 0.45, b: 0.55, a: 1 };
   dot.fills = [{
     type: "SOLID",
     color: { r: color.r, g: color.g, b: color.b },
-    opacity: color.a * 0.85,
+    opacity: (color.a === undefined ? 1 : color.a) * 0.85,
   }];
   parent.appendChild(dot);
   return dot;
@@ -384,6 +481,8 @@ async function renderAtom(parent, atom) {
 
 async function renderAtoms(atoms, width, height, background) {
   await loadAllFonts();
+  const hasIconGlyphs = atoms.some((a) => a && a.type === "icon" && a.glyph);
+  if (hasIconGlyphs) await loadFontAwesomeFonts();
 
   const screen = figma.createFrame();
   screen.name = "HTML Screen";

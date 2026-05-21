@@ -43,11 +43,29 @@
     h3 {
       margin: 0 0 8px 0;
     }
+    .options {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin: 4px 0 10px 0;
+      font-size: 12px;
+    }
+    .options label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      font-weight: 500;
+    }
   </style>
 </head>
 <body>
 
 <h3>Paste HTML (or JSX) — pixel-accurate render</h3>
+
+<div class="options">
+  <label><input type="checkbox" id="showHiddenMenus" checked> Show hidden dropdown menus</label>
+</div>
 
 <textarea id="jsx">&lt;header class="flex items-center justify-between bg-gradient-to-r from-[#02145d] to-[#04228c] px-8 py-4 text-white"&gt;
   &lt;div class="flex items-center gap-3"&gt;

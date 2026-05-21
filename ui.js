@@ -3,6 +3,7 @@ const { captureFromHtml } = require("./domCapture");
 const convertBtn = document.getElementById("convert");
 const jsxArea = document.getElementById("jsx");
 const statusEl = document.getElementById("status");
+const showHiddenMenusEl = document.getElementById("showHiddenMenus");
 
 function setStatus(message, isError) {
   if (!statusEl) return;
@@ -47,9 +48,15 @@ convertBtn.onclick = async () => {
     }
   }
 
+  const showHiddenMenus = !showHiddenMenusEl || showHiddenMenusEl.checked;
+
   let captured;
   try {
-    captured = await captureFromHtml(html, { width: 1440, waitMs: 2000 });
+    captured = await captureFromHtml(html, {
+      width: 1440,
+      waitMs: 2000,
+      showHiddenMenus,
+    });
   } catch (err) {
     setStatus("Capture failed: " + (err && err.message ? err.message : err), true);
     convertBtn.disabled = false;

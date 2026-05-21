@@ -9,25 +9,37 @@ const {
 async function captureFromHtml(html, options) {
   const opts = options || {};
   const width = opts.width || 1440;
-  const waitMs = opts.waitMs || 1800;
   const showHiddenMenus = opts.showHiddenMenus !== false;
   const multiView = opts.multiView !== false;
   const viewSelector = opts.viewSelector || ".view-section";
+  const baseUrl = normalizeBaseUrl(opts.baseUrl);
 
   const iframe = document.createElement("iframe");
+  // Width is fixed by both attribute and CSS so the inner viewport reports
+  // the value we want regardless of browser quirks. opacity:0 (not
+  // visibility:hidden) keeps the iframe in normal layout flow so its
+  // descendants compute their box sizes against the full requested width.
+  iframe.setAttribute("width", String(width));
   iframe.style.cssText =
-    "position:fixed;top:0;left:-99999px;width:" +
-    width +
-    "px;height:1px;border:0;visibility:hidden;";
+    "position:fixed;top:0;left:-99999px;width:" + width + "px;" +
+    "min-width:" + width + "px;max-width:" + width + "px;" +
+    "height:2000px;border:0;opacity:0;pointer-events:none;";
   document.body.appendChild(iframe);
 
   const libs = resolveLibrariesForHtml(html, options);
-  const wrapped = wrapHtml(html, { showHiddenMenus, libs });
+  const wrapped = wrapHtml(html, { showHiddenMenus, libs, baseUrl });
+
+  // Longer default wait when external CSS/font CDNs were injected — icon
+  // webfonts (Bootstrap Icons, Font Awesome) can take 1-2s to download
+  // and apply their `content: "\fXXX"` to ::before pseudo-elements.
+  const cdnInjected =
+    libs.bootstrap || libs.bootstrapIcons || libs.fontAwesome || libs.tailwind;
+  const waitMs = opts.waitMs || (cdnInjected ? 2600 : 1800);
 
   await new Promise((resolve) => {
     iframe.onload = () => resolve();
     iframe.srcdoc = wrapped;
-    setTimeout(resolve, 6000);
+    setTimeout(resolve, 8000);
   });
 
   await new Promise((r) => setTimeout(r, waitMs));
@@ -38,6 +50,9 @@ async function captureFromHtml(html, options) {
     document.body.removeChild(iframe);
     throw new Error("Iframe did not initialize");
   }
+
+  // Wait for icon webfonts to finish loading so ::before content resolves.
+  await waitForFonts(doc, win, cdnInjected ? 4000 : 1500);
 
   const pageBg = win.getComputedStyle(doc.body).backgroundColor;
 
@@ -84,7 +99,8 @@ async function captureOne(doc, win, width, pageBg, meta) {
   const pageHeight = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
 
   const atoms = [];
-  walk(doc.body, containerRect, win, atoms);
+  const nextId = makeIdGenerator();
+  walk(doc.body, containerRect, win, atoms, null, nextId);
 
   const imgAtoms = atoms.filter((a) => a.tag === "img" && a.src);
   const bgAtoms = atoms.filter((a) => a.bgImageUrls && a.bgImageUrls.length);
@@ -112,22 +128,35 @@ function wrapHtml(html, opts) {
   const trimmed = (html || "").trim();
   const showHiddenMenus = !opts || opts.showHiddenMenus !== false;
   const libs = (opts && opts.libs) || resolveLibrariesForHtml(trimmed, opts);
+  const baseUrl = opts && opts.baseUrl;
+
   const forceMenusCss = buildMenuForceCss(showHiddenMenus);
   const cdnTags = buildCdnHeadTags(libs);
   const baseStyle = "<style>body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;}</style>";
 
-  const headInject = forceMenusCss + cdnTags + baseStyle;
+  // <base href> makes the browser resolve every relative URL (img src,
+  // background-image url(...), link href, etc.) against the supplied path.
+  // Without it, an srcdoc iframe resolves "./logo.png" to "about:srcdoc/logo.png"
+  // and the request fails.
+  const baseTag = baseUrl ? "<base href=\"" + escapeAttr(baseUrl) + "\">" : "";
+
+  const headInject = baseTag + forceMenusCss + cdnTags + baseStyle;
 
   const hasHtml = /^<!doctype|^<html/i.test(trimmed);
   if (hasHtml) {
     let out = trimmed;
     if (/<head[^>]*>/i.test(out)) {
-      out = out.replace(/<head([^>]*)>/i, "<head$1>" + headInject);
+      // If the source already declares <base>, leave it; otherwise inject ours
+      // right after <head> so it applies to all subsequent links.
+      if (baseUrl && !/<base\s+href=/i.test(out)) {
+        out = out.replace(/<head([^>]*)>/i, "<head$1>" + baseTag);
+      }
+      // Remove baseTag from headInject if we already inserted it above
+      const restHead = headInject.startsWith(baseTag) ? headInject.slice(baseTag.length) : headInject;
+      out = out.replace(/<head([^>]*)>/i, "<head$1>" + restHead);
     } else {
       out = headInject + out;
     }
-    // Full documents may reference Bootstrap/BI in <head> already; inject only
-    // missing CDN tags when detection asked for them (buildCdnHeadTags handles that).
     return out;
   }
   if (/^<body/i.test(trimmed)) {
@@ -142,7 +171,87 @@ function wrapHtml(html, opts) {
   );
 }
 
-function walk(el, containerRect, win, atoms) {
+function escapeAttr(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
+function normalizeBaseUrl(url) {
+  if (!url) return null;
+  let u = String(url).trim();
+  if (!u) return null;
+  if (!/^https?:\/\//i.test(u) && !u.startsWith("//")) {
+    // Treat bare hosts (example.com) as https
+    if (/^[a-z0-9.-]+\.[a-z]{2,}/i.test(u)) u = "https://" + u;
+    else return null;
+  }
+  // Ensure trailing slash so <base> treats it as a directory
+  if (!/[/?#]$/.test(u) && !/\.[a-z0-9]{1,6}$/i.test(u.split("?")[0].split("#")[0])) {
+    u += "/";
+  }
+  return u;
+}
+
+async function waitForFonts(doc, win, maxMs) {
+  try {
+    if (doc && doc.fonts && typeof doc.fonts.ready === "object") {
+      await Promise.race([
+        doc.fonts.ready,
+        new Promise((r) => setTimeout(r, maxMs)),
+      ]);
+    }
+  } catch (e) { /* ignore */ }
+  // One more rAF tick so any final ::before re-paint settles.
+  await new Promise((r) => setTimeout(r, 80));
+}
+
+// Tags we always materialize as a group/section even when they have no
+// own visible styling. Helps reproduce the source structure in Figma.
+const SEMANTIC_CONTAINER_TAGS = new Set([
+  "header", "nav", "main", "section", "article", "footer", "aside",
+  "ul", "ol", "form", "fieldset", "figure", "address",
+]);
+
+// Class-name patterns that signal a layout container. Bootstrap row/col,
+// Tailwind grid/flex, generic "card"/"container"/"group" wrappers.
+const LAYOUT_CLASS_RE = /\b(row|col|col-[\w-]+|grid|grid-cols-\d+|grid-rows-\d+|flex|inline-flex|flex-row|flex-col|flex-wrap|container|container-fluid|card|panel|section|wrapper|stack|hstack|vstack|navbar|nav-bar|btn-group|input-group|breadcrumb|list-group|accordion|carousel|modal-content|offcanvas-body)\b/;
+
+function classListOf(el) {
+  const cls = (el && el.getAttribute && el.getAttribute("class")) || "";
+  return cls.split(/\s+/).filter(Boolean);
+}
+
+function isLayoutContainer(el, classes) {
+  if (!el) return false;
+  if (SEMANTIC_CONTAINER_TAGS.has(el.tagName.toLowerCase())) return true;
+  const cls = classes.join(" ");
+  return LAYOUT_CLASS_RE.test(cls);
+}
+
+function detectLayoutMode(cs, classes) {
+  const display = cs.display;
+  const cls = classes.join(" ");
+  if (/\bgrid\b/.test(cls) || display === "grid" || display === "inline-grid") {
+    const m = cls.match(/\bgrid-cols-(\d+)\b/);
+    return { mode: "GRID", direction: "HORIZONTAL", cols: m ? parseInt(m[1], 10) : null };
+  }
+  if (/\brow\b/.test(cls) || display === "flex" || display === "inline-flex") {
+    const fd = cs.flexDirection || "row";
+    const direction = fd.startsWith("column") ? "VERTICAL" : "HORIZONTAL";
+    return { mode: "FLEX", direction };
+  }
+  if (/\bflex-col\b/.test(cls)) return { mode: "FLEX", direction: "VERTICAL" };
+  if (/\bflex(?:-row)?\b/.test(cls)) return { mode: "FLEX", direction: "HORIZONTAL" };
+  // Bootstrap col-* implies vertical stack inside it
+  if (/\bcol(-\w+)?(-\d+)?\b/.test(cls)) return { mode: "STACK", direction: "VERTICAL" };
+  return null;
+}
+
+function makeIdGenerator() {
+  let n = 0;
+  return () => ++n;
+}
+
+function walk(el, containerRect, win, atoms, parentId, nextId) {
   if (!el || el.nodeType !== 1) return;
   const tag = el.tagName.toLowerCase();
   if (tag === "script" || tag === "style" || tag === "link" || tag === "meta" || tag === "title" || tag === "noscript") return;
@@ -153,21 +262,69 @@ function walk(el, containerRect, win, atoms) {
   const rect = el.getBoundingClientRect();
   if (rect.width === 0 && rect.height === 0 && tag !== "br") return;
 
-  const box = extractBoxStyle(el, cs, rect, containerRect, tag, win);
-  if (box) atoms.push(box);
+  const classes = classListOf(el);
+  const myId = nextId();
+
+  let atom = extractBoxStyle(el, cs, rect, containerRect, tag, win);
+
+  // Even if extractBoxStyle filtered the element out (no visible styling),
+  // promote it to a synthetic "group" atom when it is a layout container
+  // with multiple element children. This is what gives us row/col/grid
+  // grouping in Figma without forcing every <div> to become a frame.
+  if (!atom) {
+    const elementChildCount = Array.from(el.children).filter((c) => c.nodeType === 1).length;
+    const wantsGroup =
+      (isLayoutContainer(el, classes) && elementChildCount >= 1) ||
+      elementChildCount >= 2;
+    if (wantsGroup) {
+      atom = {
+        type: "group",
+        tag,
+        x: rect.left - containerRect.left,
+        y: rect.top - containerRect.top,
+        w: rect.width,
+        h: rect.height,
+      };
+    }
+  }
+
+  let surviveParentId = parentId;
+  if (atom) {
+    atom.id = myId;
+    atom.parentId = parentId;
+    atom.classes = classes;
+    atom.role = el.getAttribute && el.getAttribute("role");
+    atom.layout = detectLayoutMode(cs, classes);
+    atom.cssGap = parseFloat(cs.columnGap) || parseFloat(cs.gap) || 0;
+    atom.cssRowGap = parseFloat(cs.rowGap) || parseFloat(cs.gap) || 0;
+    atom.padding = {
+      top: parseFloat(cs.paddingTop) || 0,
+      right: parseFloat(cs.paddingRight) || 0,
+      bottom: parseFloat(cs.paddingBottom) || 0,
+      left: parseFloat(cs.paddingLeft) || 0,
+    };
+    // Capture CSS layout properties needed for fidelity.
+    atom.cssPosition = cs.position;
+    atom.cssJustifyContent = cs.justifyContent;
+    atom.cssAlignItems = cs.alignItems;
+    atom.cssTextAlign = cs.textAlign;
+    atom.cssOverflow = cs.overflow;
+    atoms.push(atom);
+    surviveParentId = myId;
+  }
 
   for (const childNode of el.childNodes) {
     if (childNode.nodeType === 1) {
-      walk(childNode, containerRect, win, atoms);
+      walk(childNode, containerRect, win, atoms, surviveParentId, nextId);
     } else if (childNode.nodeType === 3) {
       const text = childNode.nodeValue || "";
       if (!text.trim()) continue;
-      captureTextNode(childNode, text, cs, containerRect, atoms);
+      captureTextNode(childNode, text, cs, containerRect, atoms, surviveParentId, nextId);
     }
   }
 }
 
-function captureTextNode(textNode, text, parentCs, containerRect, atoms) {
+function captureTextNode(textNode, text, parentCs, containerRect, atoms, parentId, nextId) {
   const range = document.createRange();
   range.selectNodeContents(textNode);
   const rects = range.getClientRects();
@@ -176,6 +333,7 @@ function captureTextNode(textNode, text, parentCs, containerRect, atoms) {
     return;
   }
   let minX = Infinity, minY = Infinity, maxRight = -Infinity, maxBottom = -Infinity;
+  const topPositions = new Set();
   for (let i = 0; i < rects.length; i++) {
     const r = rects[i];
     if (r.width === 0 || r.height === 0) continue;
@@ -183,19 +341,31 @@ function captureTextNode(textNode, text, parentCs, containerRect, atoms) {
     if (r.top < minY) minY = r.top;
     if (r.right > maxRight) maxRight = r.right;
     if (r.bottom > maxBottom) maxBottom = r.bottom;
+    topPositions.add(Math.round(r.top));
   }
   if (!isFinite(minX)) return;
 
   const cleaned = collapseWhitespace(text);
-  if (!cleaned) return;
+  // Skip nodes that are purely whitespace (the space between block
+  // elements in formatted HTML, etc.).
+  if (!cleaned || !cleaned.trim()) return;
+
+  // Count how many lines the browser actually used. Single-line text
+  // should NOT be force-wrapped in Figma — different font metrics
+  // (browser's font vs Inter) would otherwise cause spurious mid-word
+  // wraps like "CORPL / INK".
+  const lineCount = Math.max(1, topPositions.size);
 
   atoms.push({
+    id: nextId(),
+    parentId,
     type: "text",
     text: maybeTransform(cleaned, parentCs.textTransform),
     x: minX - containerRect.left,
     y: minY - containerRect.top,
     w: maxRight - minX,
     h: maxBottom - minY,
+    lineCount,
     color: parentCs.color,
     fontSize: parseFloat(parentCs.fontSize) || 14,
     fontWeight: parentCs.fontWeight,
@@ -247,7 +417,7 @@ function extractBoxStyle(el, cs, rect, containerRect, tag, win) {
 
   const bg = cs.backgroundColor;
   const bgImage = cs.backgroundImage;
-  const bgImageUrls = extractBgImageUrls(bgImage);
+  const bgImageUrls = extractBgImageUrls(bgImage, el.ownerDocument);
   const bgSize = cs.backgroundSize;
   const bgRepeat = cs.backgroundRepeat;
   const bgPosition = cs.backgroundPosition;
@@ -279,11 +449,27 @@ function extractBoxStyle(el, cs, rect, containerRect, tag, win) {
   const hasRadius = radii.tl + radii.tr + radii.br + radii.bl > 0;
 
   if (tag === "img") {
+    const rawAttr = el.getAttribute("src") || "";
+    let resolvedSrc = el.currentSrc || el.src || rawAttr;
+    // If <base> wasn't set and we're inside an srcdoc iframe, `el.src` looks
+    // like "about:srcdoc/02_images/foo.png" — useless for fetch. Try to
+    // re-resolve against el.ownerDocument.baseURI as a last attempt.
+    if (/^about:srcdoc/i.test(resolvedSrc) && rawAttr) {
+      try {
+        const doc = el.ownerDocument;
+        const baseURI = doc && (doc.baseURI || doc.URL);
+        if (baseURI && baseURI !== "about:srcdoc") {
+          resolvedSrc = new URL(rawAttr, baseURI).href;
+        }
+      } catch (e) { /* keep what we had */ }
+    }
     return {
       type: "image",
       tag,
       x, y, w, h,
-      src: el.src || el.getAttribute("src") || null,
+      src: resolvedSrc || null,
+      srcAttr: rawAttr || null,
+      alt: el.getAttribute("alt") || "",
       bg, bgImage, radii, border, opacity, boxShadow,
     };
   }
@@ -353,43 +539,114 @@ function extractBoxStyle(el, cs, rect, containerRect, tag, win) {
 }
 
 async function loadImageBytes(atom) {
-  if (!atom.src) return;
-  try {
-    const resp = await fetch(atom.src, { mode: "cors" });
-    if (!resp.ok) return;
-    const buf = await resp.arrayBuffer();
-    atom.imageBytes = new Uint8Array(buf);
-  } catch (e) {
-    /* CORS / network failure - leave as placeholder */
+  if (!atom.src && !atom.srcAttr) return;
+  const tried = new Set();
+  const candidates = [];
+
+  if (atom.src) candidates.push(atom.src);
+  if (atom.srcAttr && atom.srcAttr !== atom.src) candidates.push(atom.srcAttr);
+
+  for (const url of candidates) {
+    if (!url || tried.has(url)) continue;
+    tried.add(url);
+
+    // Skip pseudo-protocols we can't resolve to bytes.
+    if (/^(about:|javascript:|chrome:|chrome-extension:|file:)/i.test(url)) continue;
+
+    // Fast path: direct CORS fetch.
+    try {
+      const resp = await fetch(url, { mode: "cors" });
+      if (resp.ok) {
+        const buf = await resp.arrayBuffer();
+        atom.imageBytes = new Uint8Array(buf);
+        atom.resolvedSrc = url;
+        return;
+      }
+    } catch (e) { /* try canvas */ }
+
+    // Fallback: canvas-based load via <img crossorigin="anonymous">.
+    try {
+      const bytes = await imageUrlToBytesViaCanvas(url);
+      if (bytes) {
+        atom.imageBytes = bytes;
+        atom.resolvedSrc = url;
+        return;
+      }
+    } catch (e) { /* try next candidate */ }
   }
+
+  // No bytes obtained — record why so the renderer can label clearly.
+  atom.loadFailedReason =
+    candidates.length === 0
+      ? "no src"
+      : candidates.some((u) => /^about:srcdoc/i.test(u))
+        ? "relative path — set Base URL"
+        : "CORS / not found";
+}
+
+function imageUrlToBytesViaCanvas(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      try {
+        const w = img.naturalWidth || img.width;
+        const h = img.naturalHeight || img.height;
+        if (!w || !h) return reject(new Error("zero-size image"));
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+        canvas.toBlob(
+          async (blob) => {
+            if (!blob) return reject(new Error("toBlob returned null"));
+            try {
+              const buf = await blob.arrayBuffer();
+              resolve(new Uint8Array(buf));
+            } catch (e) { reject(e); }
+          },
+          "image/png"
+        );
+      } catch (e) { reject(e); }
+    };
+    img.onerror = () => reject(new Error("image load error"));
+    img.src = url;
+  });
 }
 
 async function loadBgImageBytes(atom) {
   if (!atom.bgImageUrls || !atom.bgImageUrls.length) return;
-  // Walk URLs in order; first one that loads wins (CSS allows layered images
-  // but the most common case is a single url()).
   for (const url of atom.bgImageUrls) {
-    if (!url || url.startsWith("data:")) {
-      if (url && url.startsWith("data:")) {
-        const bytes = dataUrlToBytes(url);
-        if (bytes) {
-          atom.bgImageBytes = bytes;
-          atom.bgImageUrl = url;
-          return;
-        }
+    if (!url) continue;
+    if (url.startsWith("data:")) {
+      const bytes = dataUrlToBytes(url);
+      if (bytes) {
+        atom.bgImageBytes = bytes;
+        atom.bgImageUrl = url;
+        return;
       }
       continue;
     }
+    // Try direct fetch first.
     try {
       const resp = await fetch(url, { mode: "cors" });
-      if (!resp.ok) continue;
-      const buf = await resp.arrayBuffer();
-      atom.bgImageBytes = new Uint8Array(buf);
-      atom.bgImageUrl = url;
-      return;
-    } catch (e) {
-      /* try next */
-    }
+      if (resp.ok) {
+        const buf = await resp.arrayBuffer();
+        atom.bgImageBytes = new Uint8Array(buf);
+        atom.bgImageUrl = url;
+        return;
+      }
+    } catch (e) { /* fall through to canvas */ }
+    // Canvas fallback (same as <img> path)
+    try {
+      const bytes = await imageUrlToBytesViaCanvas(url);
+      if (bytes) {
+        atom.bgImageBytes = bytes;
+        atom.bgImageUrl = url;
+        return;
+      }
+    } catch (e) { /* try next URL */ }
   }
 }
 
@@ -406,14 +663,23 @@ function dataUrlToBytes(dataUrl) {
   }
 }
 
-function extractBgImageUrls(bgImage) {
+function extractBgImageUrls(bgImage, ownerDoc) {
   if (!bgImage || bgImage === "none") return [];
   const urls = [];
   const re = /url\(\s*(?:"([^"]+)"|'([^']+)'|([^)]+?))\s*\)/g;
   let m;
   while ((m = re.exec(bgImage)) !== null) {
-    const u = (m[1] || m[2] || m[3] || "").trim();
-    if (u) urls.push(u);
+    let u = (m[1] || m[2] || m[3] || "").trim();
+    if (!u) continue;
+    // Resolve relative URLs against the iframe document's base. For
+    // `<base href>` injected via wrapHtml, this turns "./bg.jpg" into
+    // an absolute URL we can fetch.
+    if (ownerDoc && !/^(https?:|data:|blob:|file:)/i.test(u) && !u.startsWith("//")) {
+      try {
+        u = new URL(u, ownerDoc.baseURI || ownerDoc.URL || "").href;
+      } catch (e) { /* leave as-is */ }
+    }
+    urls.push(u);
   }
   return urls;
 }
@@ -427,7 +693,11 @@ function parseOnclickTarget(el) {
 }
 
 function collapseWhitespace(s) {
-  return s.replace(/\s+/g, " ").trim();
+  // Collapse runs of whitespace to a single space but keep leading and
+  // trailing spaces. Inline siblings like `<strong>12</strong> Followers`
+  // depend on that leading space surviving — trimming it makes "12" run
+  // straight into "Followers".
+  return s.replace(/\s+/g, " ");
 }
 
 function maybeTransform(text, transform) {

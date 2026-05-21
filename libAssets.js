@@ -8,6 +8,11 @@ const CDN = {
     "<script src='https://cdn.tailwindcss.com'></script>",
   fontAwesome:
     "<link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css'/>",
+  // Aliases bare `fa fa-name` (FA v4 syntax) to `fa-solid fa-name`. Required
+  // for HTML that uses old <i class="fa fa-thumbs-up"></i> markup with the
+  // v6 stylesheet.
+  fontAwesomeV4Shims:
+    "<link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/v4-shims.min.css'/>",
   bootstrap:
     "<link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css'/>",
   bootstrapIcons:
@@ -48,6 +53,11 @@ function detectLibraries(html) {
     /\bfa-brands\b/.test(lower) ||
     /\bfa-[a-z0-9-]+\b/.test(lower);
 
+  // Bare v4-style "fa fa-thumbs-up" (no fa-solid/fa-regular prefix). The
+  // v6 stylesheet alone doesn't recognize these — v4-shims aliases them.
+  const wantsFaV4Shims =
+    /class\s*=\s*["'][^"']*\bfa\s+fa-[a-z0-9-]+/i.test(s);
+
   const wantsTailwind =
     hasTailwindScript ||
     /\b(bg-gradient-to-|from-\[#|to-\[#|rounded-\[)\b/.test(lower) ||
@@ -60,6 +70,7 @@ function detectLibraries(html) {
     bootstrap: wantsBootstrap && !hasBootstrapLink,
     bootstrapIcons: wantsBootstrapIcons && !hasBiLink,
     fontAwesome: wantsFontAwesome && !hasFaLink,
+    fontAwesomeV4Shims: wantsFaV4Shims || wantsFontAwesome,
     tailwind: wantsTailwind && !hasTailwindScript,
     glyphicons: wantsGlyphicons,
     // Already present in source (for logging / UI only)
@@ -74,7 +85,13 @@ function detectLibraries(html) {
 
 /** Default CDN set for bare HTML fragments with no library signals. */
 function defaultFragmentLibraries() {
-  return { tailwind: true, fontAwesome: true, bootstrap: false, bootstrapIcons: false };
+  return {
+    tailwind: true,
+    fontAwesome: true,
+    fontAwesomeV4Shims: true,
+    bootstrap: false,
+    bootstrapIcons: false,
+  };
 }
 
 function buildCdnHeadTags(libs) {
@@ -82,6 +99,8 @@ function buildCdnHeadTags(libs) {
   if (libs.bootstrap) parts.push(CDN.bootstrap);
   if (libs.bootstrapIcons) parts.push(CDN.bootstrapIcons);
   if (libs.fontAwesome) parts.push(CDN.fontAwesome);
+  // v4-shims MUST load AFTER the main FA stylesheet so its aliases apply.
+  if (libs.fontAwesomeV4Shims) parts.push(CDN.fontAwesomeV4Shims);
   if (libs.tailwind) parts.push(CDN.tailwind);
   return parts.join("");
 }
@@ -89,7 +108,25 @@ function buildCdnHeadTags(libs) {
 function buildMenuForceCss(showHiddenMenus) {
   let css =
     "*,*::before,*::after{animation:none!important;transition:none!important;}";
-  if (!showHiddenMenus) return "<style>" + css + "</style>";
+  if (!showHiddenMenus) {
+    // Defensively force-hide common dropdown / flyout patterns. Many sites
+    // toggle these via JS or `:hover`; without user interaction in the
+    // capture iframe they sometimes default to visible and end up overlaid
+    // on top of the captured screen. The `.show` / `.open` escape hatches
+    // keep intentionally-opened menus (e.g. mobile nav drawer pinned open
+    // by a checked checkbox) intact.
+    css +=
+      ".dropdown:not(.show):not(.open):not([aria-expanded='true'])," +
+      ".dropdown-menu:not(.show):not(.open)," +
+      ".submenu:not(.open):not(.show)," +
+      ".flyout:not(.open):not(.show)," +
+      ".menu-panel:not(.open):not(.show)," +
+      ".nav-dropdown:not(.open):not(.show)," +
+      "[role='menu']:not(.show):not(.open)[aria-hidden='true']," +
+      ".has-dropdown:not(:hover)>ul.submenu" +
+      "{display:none!important;}";
+    return "<style>" + css + "</style>";
+  }
 
   css +=
     /* Generic + Tailwind-style */
@@ -129,6 +166,10 @@ function resolveLibrariesForHtml(html, opts) {
   if (opts && opts.forceBootstrapIcons) libs.bootstrapIcons = true;
   if (opts && opts.forceFontAwesome) libs.fontAwesome = true;
   if (opts && opts.forceTailwind) libs.tailwind = true;
+  // Always pair v4-shims with FontAwesome unless explicitly disabled.
+  if (libs.fontAwesome && libs.fontAwesomeV4Shims !== false) {
+    libs.fontAwesomeV4Shims = true;
+  }
 
   return libs;
 }
@@ -137,9 +178,30 @@ function isIconElement(el) {
   if (!el || el.nodeType !== 1) return false;
   const tag = el.tagName.toLowerCase();
   if (tag === "i" || tag === "svg") return true;
+
   const cls = el.getAttribute("class") || "";
-  if (tag === "span" && /\b(bi-|glyphicon)\b/.test(cls)) return true;
-  return false;
+  // Bootstrap Icons can appear on any tag: `<span class="bi bi-pencil">`,
+  // `<div class="bi-alarm">`, `<button class="btn"><i class="bi bi-x">`.
+  // Match any element whose classes include an icon-set token AND that
+  // has no element children (icon nodes are leaves). Also matches FA v4
+  // syntax (`fa fa-thumbs-up`).
+  if (!/\b(bi|bi-[\w-]+|glyphicon|glyphicon-[\w-]+|fa|fa-[\w-]+|material-icons|material-symbols-[\w-]+)\b/.test(cls)) {
+    return false;
+  }
+  // Bare `fa` requires a companion `fa-NAME` to count.
+  if (/\bfa\b/.test(cls) && !/\bfa-[\w-]+\b/.test(cls)) {
+    if (tag !== "i") return false;
+  }
+  // Don't treat `class="bi"` alone (no specific bi-NAME) as an icon — too noisy.
+  if (/\bbi\b/.test(cls) && !/\bbi-[\w-]+\b/.test(cls)) {
+    if (tag !== "i") return false;
+  }
+  // Must be a leaf-ish node — icons don't have meaningful element children.
+  for (let i = 0; i < el.children.length; i++) {
+    const child = el.children[i];
+    if (child && child.nodeType === 1) return false;
+  }
+  return true;
 }
 
 function iconSetFromClasses(classNames, fontFamily) {
@@ -147,7 +209,12 @@ function iconSetFromClasses(classNames, fontFamily) {
   const fam = String(fontFamily || "").toLowerCase();
   if (/\bbi-/.test(cls) || fam.includes("bootstrap-icons")) return "bootstrap-icons";
   if (/\bglyphicon/.test(cls) || fam.includes("glyphicons")) return "glyphicons";
-  if (/\bfa-/.test(cls) || fam.includes("font awesome") || fam.includes("fontawesome")) {
+  if (
+    /\bfa-/.test(cls) ||
+    /\bfa\s+fa-/.test(cls) ||
+    fam.includes("font awesome") ||
+    fam.includes("fontawesome")
+  ) {
     return "fontawesome";
   }
   return "unknown";

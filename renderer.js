@@ -409,7 +409,12 @@ async function renderBox(parent, atom) {
 
 async function renderImage(parent, atom) {
   const frame = figma.createFrame();
-  frame.name = "img";
+  // Name encodes alt text and src so the user can find unloaded images
+  // in the Figma layer panel and fix the base URL.
+  const labelBits = ["img"];
+  if (atom.alt) labelBits.push(JSON.stringify(atom.alt));
+  if (atom.srcAttr) labelBits.push(atom.srcAttr);
+  frame.name = labelBits.join(" ");
   frame.x = Math.round(atom.x);
   frame.y = Math.round(atom.y);
   frame.resize(Math.max(1, Math.round(atom.w)), Math.max(1, Math.round(atom.h)));
@@ -423,13 +428,41 @@ async function renderImage(parent, atom) {
       const bytes = atom.imageBytes instanceof Uint8Array ? atom.imageBytes : new Uint8Array(atom.imageBytes);
       const image = figma.createImage(bytes);
       frame.fills = [{ type: "IMAGE", scaleMode: "FILL", imageHash: image.hash }];
-    } catch (e) {
-      frame.fills = [{ type: "SOLID", color: { r: 0.91, g: 0.93, b: 0.96 } }];
-    }
-  } else {
-    frame.fills = [{ type: "SOLID", color: { r: 0.91, g: 0.93, b: 0.96 } }];
+      parent.appendChild(frame);
+      return frame;
+    } catch (e) { /* fall through to placeholder */ }
   }
+
+  // Placeholder: clean neutral-gray fill at the captured dimensions. The
+  // border-radius (applyCorners above) is honored, so circular avatars
+  // render as circles, not dashed squares. Error details live in the
+  // layer name to keep the canvas visually clean.
+  frame.fills = [{ type: "SOLID", color: { r: 0.9, g: 0.92, b: 0.95 } }];
+  frame.strokes = [];
+  if ("dashPattern" in frame) {
+    try { frame.dashPattern = []; } catch (e) { /* */ }
+  }
+  const reason = atom.loadFailedReason || "image not loaded";
+  frame.name = "[missing] " + frame.name + " — " + reason;
   parent.appendChild(frame);
+
+  // Draw a tiny picture-icon glyph centered in the frame, but only when
+  // the frame is big enough that a glyph won't dominate (e.g. >= 32px on
+  // both axes — avatars 24px and smaller stay as a plain dot).
+  if (atom.w >= 32 && atom.h >= 32) {
+    try {
+      const icon = figma.createText();
+      icon.fontName = { family: "Inter", style: "Regular" };
+      icon.fontSize = Math.min(24, Math.max(12, Math.min(atom.w, atom.h) * 0.35));
+      icon.characters = "\u2B1C"; // unicode picture-frame glyph
+      icon.fills = [{ type: "SOLID", color: { r: 0.62, g: 0.66, b: 0.72 } }];
+      icon.textAlignHorizontal = "CENTER";
+      icon.x = Math.round(atom.x + (atom.w - icon.width) / 2);
+      icon.y = Math.round(atom.y + (atom.h - icon.height) / 2);
+      parent.appendChild(icon);
+    } catch (e) { /* font not loaded; the gray fill alone is enough */ }
+  }
+
   return frame;
 }
 
@@ -475,6 +508,21 @@ async function renderText(parent, atom) {
 
   txt.x = Math.round(atom.x);
   txt.y = Math.round(atom.y);
+
+  // Only force a fixed width on multi-line text (i.e. text the browser
+  // actually wrapped). Single-line text is left in WIDTH_AND_HEIGHT mode
+  // so Inter's slightly different metrics don't cause spurious mid-word
+  // wraps like "CORPL / INK" or "Dashbo / ard".
+  if (atom.lineCount && atom.lineCount > 1 && atom.w && atom.w > 0) {
+    try {
+      txt.textAutoResize = "HEIGHT";
+      txt.resize(
+        Math.max(1, Math.round(atom.w)),
+        Math.max(1, Math.round(txt.height || atom.h || 1))
+      );
+    } catch (e) { /* fall back to default auto-resize */ }
+  }
+
   parent.appendChild(txt);
   return txt;
 }
@@ -552,6 +600,7 @@ async function renderAtom(parent, atom) {
     if (atom.type === "image") return renderImage(parent, atom);
     if (atom.type === "input") return renderInput(parent, atom);
     if (atom.type === "icon") return renderIcon(parent, atom);
+    if (atom.type === "group") return renderGroup(parent, atom);
     return renderBox(parent, atom);
   } catch (e) {
     console.error("renderAtom error", atom && atom.tag, e && e.message);
@@ -559,13 +608,230 @@ async function renderAtom(parent, atom) {
   }
 }
 
+// Synthetic container with no own styling — emitted by walk() for layout
+// containers (row/col/grid/flex/section) that group children.
+async function renderGroup(parent, atom) {
+  const frame = figma.createFrame();
+  frame.name = atom.tag + (atom.classes && atom.classes.length ? " ." + atom.classes[0] : "");
+  frame.x = Math.round(atom.x);
+  frame.y = Math.round(atom.y);
+  frame.resize(Math.max(1, Math.round(atom.w)), Math.max(1, Math.round(atom.h)));
+  frame.fills = [];
+  frame.clipsContent = false;
+  parent.appendChild(frame);
+  return frame;
+}
+
+// Map CSS justify-content / align-items strings to Figma auto-layout enums.
+const JUSTIFY_MAP = {
+  "flex-start": "MIN",
+  "start": "MIN",
+  "left": "MIN",
+  "flex-end": "MAX",
+  "end": "MAX",
+  "right": "MAX",
+  "center": "CENTER",
+  "space-between": "SPACE_BETWEEN",
+};
+const ALIGN_MAP = {
+  "flex-start": "MIN",
+  "start": "MIN",
+  "stretch": "MIN",
+  "normal": "MIN",
+  "flex-end": "MAX",
+  "end": "MAX",
+  "center": "CENTER",
+  "baseline": "CENTER",
+};
+
+// Convert captured layout hints into Figma auto-layout settings on a frame.
+// Returns { applied: bool, isGrid: bool } so callers know how to size the
+// container after children are appended.
+function applyAutoLayout(node, atom) {
+  if (!node || !atom || !atom.layout) return { applied: false, isGrid: false };
+  if (!("layoutMode" in node)) return { applied: false, isGrid: false };
+  const layout = atom.layout;
+  const isGrid = layout.mode === "GRID";
+  const direction = isGrid
+    ? "HORIZONTAL"
+    : (layout.direction === "VERTICAL" ? "VERTICAL" : "HORIZONTAL");
+  try {
+    node.layoutMode = direction;
+    node.primaryAxisSizingMode = "FIXED";
+    node.counterAxisSizingMode = "FIXED";
+
+    if (atom.padding) {
+      node.paddingTop = atom.padding.top || 0;
+      node.paddingRight = atom.padding.right || 0;
+      node.paddingBottom = atom.padding.bottom || 0;
+      node.paddingLeft = atom.padding.left || 0;
+    }
+
+    const colGap = atom.cssGap || 0;
+    const rowGap = atom.cssRowGap || atom.cssGap || 0;
+    node.itemSpacing = direction === "HORIZONTAL" ? colGap : rowGap;
+
+    if (isGrid && "layoutWrap" in node) {
+      try { node.layoutWrap = "WRAP"; } catch (e) { /* older Figma */ }
+      if ("counterAxisSpacing" in node) {
+        try { node.counterAxisSpacing = rowGap; } catch (e) { /* */ }
+      }
+    }
+
+    // Honor CSS justify-content (primary axis) and align-items (counter axis).
+    const justify = JUSTIFY_MAP[String(atom.cssJustifyContent || "").toLowerCase()];
+    const align = ALIGN_MAP[String(atom.cssAlignItems || "").toLowerCase()];
+    if (justify && "primaryAxisAlignItems" in node) {
+      try { node.primaryAxisAlignItems = justify; } catch (e) { /* */ }
+    }
+    if (align && "counterAxisAlignItems" in node) {
+      try { node.counterAxisAlignItems = align; } catch (e) { /* */ }
+    } else if ("counterAxisAlignItems" in node) {
+      node.counterAxisAlignItems = "MIN";
+    }
+  } catch (e) { /* layoutMode not applicable */ }
+
+  return { applied: true, isGrid };
+}
+
+// Decide whether `atom` should host its children as Figma children.
+// Containers (group/box) with at least one child atom in the captured tree
+// are materialized; text/icon/image/input are always leaves.
+function isContainerAtom(atom) {
+  if (!atom) return false;
+  return atom.type === "group" || atom.type === "box";
+}
+
+// Build a parentId-indexed map of atoms.
+function buildAtomIndex(atoms) {
+  const byId = new Map();
+  const childrenOf = new Map();
+  for (const a of atoms) {
+    if (a.id == null) continue;
+    byId.set(a.id, a);
+    if (!childrenOf.has(a.parentId)) childrenOf.set(a.parentId, []);
+    childrenOf.get(a.parentId).push(a);
+  }
+  return { byId, childrenOf };
+}
+
+// Render atoms hierarchically inside `screenFrame`. Returns array of
+// { atom, node } so callers can attach reactions / collect colors.
+// When `useAutoLayout` is true, containers become Figma auto-layout frames
+// (good for responsive editing). When false (default), every container is a
+// plain frame and every child sits at its captured absolute x/y — pixel-
+// perfect to the browser render, no Figma-side reflow.
+async function renderHierarchical(screenFrame, atoms, useAutoLayout) {
+  const { byId, childrenOf } = buildAtomIndex(atoms);
+  const created = []; // { atom, node }
+  const nodeByAtomId = new Map();
+
+  async function renderOne(parentFigmaNode, atom, originX, originY) {
+    const localAtom = {
+      ...atom,
+      x: atom.x - originX,
+      y: atom.y - originY,
+    };
+    const node = await renderAtom(parentFigmaNode, localAtom);
+    if (!node) return null;
+    nodeByAtomId.set(atom.id, node);
+    created.push({ atom, node });
+
+    const kids = childrenOf.get(atom.id) || [];
+
+    if (useAutoLayout) {
+      // Auto-layout path: containers become flex/grid frames; absolute
+      // children get layoutPositioning=ABSOLUTE so they don't shove
+      // siblings around.
+      const isAbsolute =
+        atom.cssPosition === "absolute" || atom.cssPosition === "fixed";
+      if (isAbsolute && "layoutPositioning" in node) {
+        try {
+          node.layoutPositioning = "ABSOLUTE";
+          if ("x" in node) node.x = Math.round(localAtom.x);
+          if ("y" in node) node.y = Math.round(localAtom.y);
+        } catch (e) { /* parent isn't auto-layout — no-op is fine */ }
+      }
+
+      if (kids.length && isContainerAtom(atom) && "appendChild" in node) {
+        const beforeApply = node.layoutMode;
+        const al = applyAutoLayout(node, atom);
+        const isAutoLayoutNode =
+          al.applied || (node.layoutMode && node.layoutMode !== "NONE" && node.layoutMode !== beforeApply);
+
+        for (const kid of kids) {
+          await renderOne(node, kid, atom.x, atom.y);
+        }
+
+        if (isAutoLayoutNode) {
+          for (const child of node.children || []) {
+            if (child.layoutPositioning === "ABSOLUTE") continue;
+            if ("layoutSizingHorizontal" in child) {
+              try { child.layoutSizingHorizontal = "FIXED"; } catch (e) { /* */ }
+            }
+            if ("layoutSizingVertical" in child) {
+              try { child.layoutSizingVertical = "FIXED"; } catch (e) { /* */ }
+            }
+          }
+          try {
+            if ("primaryAxisSizingMode" in node) node.primaryAxisSizingMode = "FIXED";
+            if ("counterAxisSizingMode" in node) {
+              node.counterAxisSizingMode = al.isGrid ? "AUTO" : "FIXED";
+            }
+            if ("clipsContent" in node) node.clipsContent = false;
+          } catch (e) { /* */ }
+        }
+      } else if (kids.length) {
+        for (const kid of kids) {
+          await renderOne(parentFigmaNode, kid, originX, originY);
+        }
+      }
+      return node;
+    }
+
+    // Absolute-positioning path (default). Every container is a plain
+    // frame sized to its captured box; every child sits inside it at its
+    // captured x/y. Nothing reflows — what you saw in the browser is
+    // what you get in Figma.
+    if (kids.length && isContainerAtom(atom) && "appendChild" in node) {
+      if ("clipsContent" in node) node.clipsContent = false;
+      for (const kid of kids) {
+        await renderOne(node, kid, atom.x, atom.y);
+      }
+    } else if (kids.length) {
+      for (const kid of kids) {
+        await renderOne(parentFigmaNode, kid, originX, originY);
+      }
+    }
+    return node;
+  }
+
+  const roots = childrenOf.get(null) || [];
+  for (const root of roots) {
+    await renderOne(screenFrame, root, 0, 0);
+  }
+
+  // Atoms whose parentId pointed to a filtered-out element have parentId
+  // unset; render any leftovers directly on the screen.
+  for (const atom of atoms) {
+    if (nodeByAtomId.has(atom.id)) continue;
+    if (atom.parentId != null && byId.has(atom.parentId)) continue;
+    await renderOne(screenFrame, atom, 0, 0);
+  }
+
+  return created;
+}
+
 async function renderAtoms(atoms, width, height, background) {
   // Backwards-compatible single-screen entry point.
   return renderScreens([{ name: "screen", atoms, width, height, background }]);
 }
 
-async function renderScreens(screens) {
+async function renderScreens(screens, options) {
   await loadAllFonts();
+
+  const opts = options || {};
+  const useAutoLayout = !!opts.useAutoLayout;
 
   const iconSets = collectIconSetsFromScreens(screens);
   if (iconSets.size) await loadIconFonts(iconSets);
@@ -607,11 +873,23 @@ async function renderScreens(screens) {
     frameByView.set(name, frame);
     createdFrames.push(frame);
 
-    for (const atom of screen.atoms || []) {
-      const node = await renderAtom(frame, atom);
-      if (!node) continue;
-      if (atom.onclickTarget) {
-        interactiveBindings.push({ nodeId: node.id, target: atom.onclickTarget });
+    // Capture atom IDs were assigned by domCapture; if missing (legacy
+    // payload), bail to the original flat renderer.
+    const hasIds = (screen.atoms || []).some((a) => a && a.id != null);
+    if (hasIds) {
+      const rendered = await renderHierarchical(frame, screen.atoms || [], useAutoLayout);
+      for (const { atom, node } of rendered) {
+        if (atom.onclickTarget && node) {
+          interactiveBindings.push({ nodeId: node.id, target: atom.onclickTarget });
+        }
+      }
+    } else {
+      for (const atom of screen.atoms || []) {
+        const node = await renderAtom(frame, atom);
+        if (!node) continue;
+        if (atom.onclickTarget) {
+          interactiveBindings.push({ nodeId: node.id, target: atom.onclickTarget });
+        }
       }
     }
 
@@ -655,8 +933,187 @@ async function renderScreens(screens) {
     } catch (e) { /* not supported in this file */ }
   }
 
+  // Brand color schema: collect unique non-neutral colors used as backgrounds
+  // / strokes / text fills across every screen and create a Figma variable
+  // collection "Theme" so the user has a starting palette to bind from.
+  try {
+    await createThemeColorCollection(screens);
+  } catch (e) {
+    console.error("Theme creation skipped:", e && e.message);
+  }
+
   figma.viewport.scrollAndZoomIntoView(createdFrames);
   return createdFrames.length;
+}
+
+// ---- Theme / brand color collection ----------------------------------------
+
+function rgbToHex(r, g, b) {
+  const to2 = (n) => {
+    const v = Math.max(0, Math.min(255, Math.round(n * 255)));
+    return v.toString(16).padStart(2, "0");
+  };
+  return ("#" + to2(r) + to2(g) + to2(b)).toUpperCase();
+}
+
+function isNeutralColor(c) {
+  if (!c) return true;
+  const max = Math.max(c.r, c.g, c.b);
+  const min = Math.min(c.r, c.g, c.b);
+  const sat = max === 0 ? 0 : (max - min) / max;
+  // Pure neutral (gray/white/black) or extreme light/dark with no chroma.
+  if (sat < 0.08) return true;
+  if (max < 0.04) return true;     // near-black
+  if (min > 0.96) return true;     // near-white
+  return false;
+}
+
+function collectColorFrequency(screens) {
+  const freq = new Map();
+  const bump = (color) => {
+    if (!color) return;
+    const c = parseCssColor(color);
+    if (!c || c.a === 0) return;
+    if (isNeutralColor(c)) return;
+    const hex = rgbToHex(c.r, c.g, c.b);
+    freq.set(hex, (freq.get(hex) || 0) + 1);
+  };
+  for (const screen of screens || []) {
+    for (const atom of screen.atoms || []) {
+      if (!atom) continue;
+      bump(atom.bg);
+      bump(atom.color);
+      if (atom.border) {
+        bump(atom.border.top && atom.border.top.c);
+        bump(atom.border.right && atom.border.right.c);
+      }
+    }
+  }
+  return [...freq.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([hex, count]) => ({ hex, count }));
+}
+
+function hexToRgb01(hex) {
+  const h = hex.replace("#", "");
+  return {
+    r: parseInt(h.slice(0, 2), 16) / 255,
+    g: parseInt(h.slice(2, 4), 16) / 255,
+    b: parseInt(h.slice(4, 6), 16) / 255,
+  };
+}
+
+async function createThemeColorCollection(screens) {
+  if (!figma.variables || typeof figma.variables.createVariableCollection !== "function") {
+    return; // Variables API not available in this Figma client
+  }
+  const palette = collectColorFrequency(screens).slice(0, 8);
+  if (!palette.length) return;
+
+  // Reuse "Theme" collection if it exists, else create fresh.
+  let collection = null;
+  try {
+    const existing = typeof figma.variables.getLocalVariableCollectionsAsync === "function"
+      ? await figma.variables.getLocalVariableCollectionsAsync()
+      : figma.variables.getLocalVariableCollections();
+    collection = existing.find((c) => c.name === "Theme");
+  } catch (e) { /* fall through */ }
+  if (!collection) {
+    collection = figma.variables.createVariableCollection("Theme");
+  }
+  const modeId = collection.modes[0].modeId;
+
+  // Index existing variables by name so reruns update in place instead of
+  // creating brand/color-01, brand/color-01 2, brand/color-01 3, etc.
+  const existingByName = new Map();
+  try {
+    const allVars = typeof figma.variables.getLocalVariablesAsync === "function"
+      ? await figma.variables.getLocalVariablesAsync("COLOR")
+      : figma.variables.getLocalVariables("COLOR");
+    for (const v of allVars || []) {
+      if (v.variableCollectionId === collection.id) existingByName.set(v.name, v);
+    }
+  } catch (e) { /* */ }
+
+  const created = [];
+  palette.forEach((entry, idx) => {
+    const name = "brand/color-" + String(idx + 1).padStart(2, "0");
+    let v = existingByName.get(name);
+    if (!v) {
+      try {
+        v = figma.variables.createVariable(name, collection, "COLOR");
+      } catch (e) { return; }
+    }
+    if (!v) return;
+    try {
+      v.setValueForMode(modeId, hexToRgb01(entry.hex));
+      v.description = "Detected from imported HTML — used " + entry.count + " time(s).";
+      v.scopes = ["FRAME_FILL", "SHAPE_FILL", "TEXT_FILL", "STROKE_COLOR"];
+      created.push({ name, hex: entry.hex });
+    } catch (e) { /* */ }
+  });
+
+  // Sample swatches: small frame on the page showing each brand color, so
+  // the variables are discoverable visually. Reuse an existing one if
+  // present so reruns don't pile up duplicate palettes on the canvas.
+  if (created.length && screens.length) {
+    const existingPalette = figma.currentPage.findOne((n) => n.name === "Theme Palette");
+    if (existingPalette) {
+      try { existingPalette.remove(); } catch (e) { /* */ }
+    }
+
+    const swatchFrame = figma.createFrame();
+    swatchFrame.name = "Theme Palette";
+    swatchFrame.layoutMode = "HORIZONTAL";
+    swatchFrame.primaryAxisSizingMode = "AUTO";
+    swatchFrame.counterAxisSizingMode = "AUTO";
+    swatchFrame.itemSpacing = 12;
+    swatchFrame.paddingTop = swatchFrame.paddingBottom = 16;
+    swatchFrame.paddingLeft = swatchFrame.paddingRight = 16;
+    swatchFrame.cornerRadius = 12;
+    swatchFrame.fills = [{ type: "SOLID", color: { r: 0.98, g: 0.98, b: 0.98 } }];
+
+    for (const item of created) {
+      const cell = figma.createFrame();
+      cell.name = item.name;
+      cell.layoutMode = "VERTICAL";
+      cell.primaryAxisSizingMode = "AUTO";
+      cell.counterAxisSizingMode = "AUTO";
+      cell.itemSpacing = 6;
+      cell.fills = [];
+
+      const swatch = figma.createFrame();
+      swatch.name = item.name + "-swatch";
+      swatch.resize(64, 64);
+      swatch.cornerRadius = 8;
+      swatch.fills = [{ type: "SOLID", color: hexToRgb01(item.hex) }];
+      cell.appendChild(swatch);
+
+      try {
+        const label = figma.createText();
+        label.fontName = { family: "Inter", style: "Regular" };
+        label.fontSize = 10;
+        label.characters = item.hex;
+        cell.appendChild(label);
+      } catch (e) { /* font not loaded */ }
+
+      swatchFrame.appendChild(cell);
+    }
+
+    // Place the palette above the leftmost imported screen.
+    let minX = Infinity;
+    let minY = Infinity;
+    for (const child of figma.currentPage.children) {
+      if (child === swatchFrame) continue;
+      if (typeof child.x === "number" && child.x < minX) minX = child.x;
+      if (typeof child.y === "number" && child.y < minY) minY = child.y;
+    }
+    if (!isFinite(minX)) minX = 0;
+    if (!isFinite(minY)) minY = 0;
+    figma.currentPage.appendChild(swatchFrame);
+    swatchFrame.x = minX;
+    swatchFrame.y = minY - swatchFrame.height - 60;
+  }
 }
 
 module.exports = { renderAtoms, renderScreens };

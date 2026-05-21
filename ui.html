@@ -67,8 +67,14 @@
 </p>
 
 <div class="options">
-  <label><input type="checkbox" id="showHiddenMenus" checked> Show hidden dropdown menus</label>
-  <label><input type="checkbox" id="multiView" checked> One frame per <code>.view-section</code> (Present-mode navigation)</label>
+  <label><input type="checkbox" id="showHiddenMenus"> Show hidden dropdown menus <span style="color:#888;">(opens all dropdowns &mdash; they'll overlay the header)</span></label>
+  <label><input type="checkbox" id="multiView"> One frame per <code>.view-section</code> (Present-mode navigation)</label>
+  <label><input type="checkbox" id="useAutoLayout"> Use Figma auto-layout <span style="color:#888;">(responsive, may shift positions)</span></label>
+</div>
+
+<div class="row" style="margin-bottom:10px;">
+  <label for="baseUrl" style="white-space:nowrap;">Base URL for <code>img</code>/CSS:</label>
+  <input type="text" id="baseUrl" placeholder="https://example.com/site/" style="flex:1;padding:4px 8px;font-size:12px;">
 </div>
 
 <textarea id="jsx">&lt;header class="flex items-center justify-between bg-gradient-to-r from-[#02145d] to-[#04228c] px-8 py-4 text-white"&gt;

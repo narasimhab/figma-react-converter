@@ -27,7 +27,9 @@ figma.ui.onmessage = async (msg) => {
     }
 
     const totalAtoms = screens.reduce((n, s) => n + (s.atoms ? s.atoms.length : 0), 0);
-    const count = await renderScreens(screens);
+    const count = await renderScreens(screens, {
+      useAutoLayout: !!msg.useAutoLayout,
+    });
     figma.notify("Rendered " + count + " screen(s), " + totalAtoms + " atoms.");
   } catch (err) {
     const message = err && err.message ? err.message : String(err);

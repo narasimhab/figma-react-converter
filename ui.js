@@ -5,6 +5,8 @@ const jsxArea = document.getElementById("jsx");
 const statusEl = document.getElementById("status");
 const showHiddenMenusEl = document.getElementById("showHiddenMenus");
 const multiViewEl = document.getElementById("multiView");
+const useAutoLayoutEl = document.getElementById("useAutoLayout");
+const baseUrlEl = document.getElementById("baseUrl");
 
 function formatLibrariesNote(libs) {
   if (!libs) return "";
@@ -15,6 +17,19 @@ function formatLibrariesNote(libs) {
   if (libs.tailwind || (libs.linked && libs.linked.tailwind)) names.push("Tailwind");
   if (!names.length) return "";
   return " Libraries: " + names.join(", ") + ".";
+}
+
+function collectRelativeImgPaths(html) {
+  const out = [];
+  const re = /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const src = m[1].trim();
+    if (!src) continue;
+    if (/^(https?:|data:|blob:|file:|\/\/)/i.test(src)) continue;
+    out.push(src);
+  }
+  return out;
 }
 
 function setStatus(message, isError) {
@@ -61,15 +76,34 @@ convertBtn.onclick = async () => {
   }
 
   const showHiddenMenus = !showHiddenMenusEl || showHiddenMenusEl.checked;
-  const multiView = !multiViewEl || multiViewEl.checked;
+  // Multi-view defaults to OFF — opt-in only. Otherwise dashboards with
+  // multiple .view-section blocks produce N frames per click, which feels
+  // like duplicates.
+  const multiView = multiViewEl ? multiViewEl.checked : false;
+  // Auto-layout is opt-in. Default is plain frames + captured absolute
+  // coordinates, which matches the browser pixel-for-pixel.
+  const useAutoLayout = useAutoLayoutEl ? useAutoLayoutEl.checked : false;
+  const baseUrl = baseUrlEl ? (baseUrlEl.value || "").trim() : "";
+
+  // Detect relative image paths in the source and warn if no base URL.
+  const relImgPaths = collectRelativeImgPaths(html);
+  if (relImgPaths.length && !baseUrl) {
+    setStatus(
+      "Heads up: " + relImgPaths.length + " <img> tag(s) use relative paths (e.g. \"" +
+        relImgPaths[0] + "\") but Base URL is empty — those will render as placeholders. " +
+        "Set Base URL to where the images are HTTP-served and re-convert.",
+      false
+    );
+    await new Promise((r) => setTimeout(r, 50));
+  }
 
   let captured;
   try {
     captured = await captureFromHtml(html, {
       width: 1440,
-      waitMs: 2000,
       showHiddenMenus,
       multiView,
+      baseUrl: baseUrl || null,
     });
   } catch (err) {
     setStatus("Capture failed: " + (err && err.message ? err.message : err), true);
@@ -80,8 +114,25 @@ convertBtn.onclick = async () => {
   const screens = captured.screens || [];
   const totalAtoms = screens.reduce((n, s) => n + (s.atoms ? s.atoms.length : 0), 0);
   const libNote = formatLibrariesNote(captured.libraries);
+
+  let imgTotal = 0;
+  let imgFailed = 0;
+  for (const s of screens) {
+    for (const a of s.atoms || []) {
+      if (a && a.type === "image") {
+        imgTotal++;
+        if (!a.imageBytes) imgFailed++;
+      }
+    }
+  }
+  const imgNote = imgTotal
+    ? " Images: " + (imgTotal - imgFailed) + "/" + imgTotal + " loaded" +
+      (imgFailed ? " (" + imgFailed + " failed — check Base URL)." : ".")
+    : "";
+
   setStatus(
-    "Captured " + screens.length + " screen(s), " + totalAtoms + " atoms." + libNote + " Sending to Figma...",
+    "Captured " + screens.length + " screen(s), " + totalAtoms + " atoms." +
+      imgNote + libNote + " Sending to Figma...",
     false
   );
 
@@ -90,6 +141,7 @@ convertBtn.onclick = async () => {
       pluginMessage: {
         type: "renderAtoms",
         screens,
+        useAutoLayout,
       },
     },
     "*"

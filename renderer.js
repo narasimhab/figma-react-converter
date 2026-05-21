@@ -404,6 +404,29 @@ async function renderBox(parent, atom) {
   applyShadow(frame, atom.boxShadow);
   applyOpacity(frame, atom.opacity);
   parent.appendChild(frame);
+
+  // CSS `background-image: url(...svg)` becomes a vector overlay rather
+  // than a raster fill, so the user gets editable paths in Figma.
+  if (atom.bgSvgString) {
+    try {
+      const svgNode = figma.createNodeFromSvg(atom.bgSvgString);
+      if (svgNode) {
+        svgNode.name = "svg-bg";
+        svgNode.x = 0;
+        svgNode.y = 0;
+        try {
+          svgNode.resize(
+            Math.max(1, Math.round(atom.w)),
+            Math.max(1, Math.round(atom.h))
+          );
+        } catch (e) { /* */ }
+        frame.appendChild(svgNode);
+      }
+    } catch (e) {
+      console.warn("createNodeFromSvg (bg) failed:", e && e.message);
+    }
+  }
+
   return frame;
 }
 
@@ -594,10 +617,53 @@ async function renderIcon(parent, atom) {
   return dot;
 }
 
+async function renderSvg(parent, atom) {
+  // Inline <svg> elements and <img src="*.svg"> get imported as real
+  // Figma vector layers via createNodeFromSvg, so users can edit paths,
+  // change colors, swap fills, etc. We resize the imported group to the
+  // captured bounding box so positioning matches the HTML layout.
+  if (!atom.svgString) {
+    // Fall through to a placeholder if we have no markup (e.g. cross-
+    // origin <img src="*.svg"> blocked by CORS).
+    return renderImage(parent, atom);
+  }
+  let node;
+  try {
+    node = figma.createNodeFromSvg(atom.svgString);
+  } catch (e) {
+    console.warn("createNodeFromSvg failed:", e && e.message);
+    return renderImage(parent, {
+      ...atom,
+      type: "image",
+      loadFailedReason: "invalid SVG markup",
+    });
+  }
+  if (!node) return renderImage(parent, atom);
+
+  node.name = "svg" + (atom.tag === "img" ? " (img.src=" + (atom.srcAttr || atom.src || "") + ")" : "");
+  node.x = Math.round(atom.x);
+  node.y = Math.round(atom.y);
+  const targetW = Math.max(1, Math.round(atom.w || node.width || 24));
+  const targetH = Math.max(1, Math.round(atom.h || node.height || 24));
+  try { node.resize(targetW, targetH); } catch (e) { /* createNodeFromSvg result might not support resize */ }
+  if (atom.opacity != null && atom.opacity !== 1 && "opacity" in node) {
+    try { node.opacity = atom.opacity; } catch (e) { /* */ }
+  }
+  parent.appendChild(node);
+  return node;
+}
+
 async function renderAtom(parent, atom) {
   try {
     if (atom.type === "text") return renderText(parent, atom);
-    if (atom.type === "image") return renderImage(parent, atom);
+    if (atom.type === "svg") return renderSvg(parent, atom);
+    if (atom.type === "image") {
+      // <img src="*.svg"> may have been upgraded to a vector during
+      // capture — handle the case where svgString arrived on an
+      // image-typed atom too.
+      if (atom.svgString) return renderSvg(parent, atom);
+      return renderImage(parent, atom);
+    }
     if (atom.type === "input") return renderInput(parent, atom);
     if (atom.type === "icon") return renderIcon(parent, atom);
     if (atom.type === "group") return renderGroup(parent, atom);

@@ -77,6 +77,11 @@
   <input type="text" id="baseUrl" placeholder="https://example.com/site/" style="flex:1;padding:4px 8px;font-size:12px;">
 </div>
 
+<details style="margin-bottom:10px;">
+  <summary style="font-size:11px;color:#555;cursor:pointer;">Additional CSS (paste content of any unreachable <code>&lt;link rel="stylesheet"&gt;</code>) &mdash; needed for templates like TailAdmin whose custom classes (<code>.menu-item</code>, <code>.menu-item-text</code>, etc.) live in an external <code>style.css</code> that the sandbox can't load.</summary>
+  <textarea id="extraCss" placeholder="/* paste contents of style.css / theme.css here */" style="width:100%;height:120px;font-family:monospace;font-size:11px;box-sizing:border-box;margin-top:6px;"></textarea>
+</details>
+
 <textarea id="jsx">&lt;header class="flex items-center justify-between bg-gradient-to-r from-[#02145d] to-[#04228c] px-8 py-4 text-white"&gt;
   &lt;div class="flex items-center gap-3"&gt;
     &lt;span class="font-black text-lg uppercase"&gt;CorpLink&lt;/span&gt;

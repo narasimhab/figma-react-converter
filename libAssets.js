@@ -146,6 +146,72 @@ function buildMenuForceCss(showHiddenMenus) {
   return "<style>" + css + "</style>";
 }
 
+// Many admin templates (TailAdmin, AdminLTE, Materio, etc.) put critical
+// layout rules in an external `style.css` that the sandbox iframe can't load.
+// Without those rules, items inside `<a class="menu-item">` etc. stack as
+// block-level children — the SVG icon, the text label and the chevron each
+// end up on their own row. We detect the most common class patterns and
+// inject a *best-effort* fallback stylesheet so the browser lays them out
+// reasonably BEFORE we run capture. User-supplied "Additional CSS" is
+// injected after this fallback so it can override anything.
+function detectTemplateFallbacks(html) {
+  const out = [];
+  if (!html) return out;
+  const lc = String(html).toLowerCase();
+  // TailAdmin / Tailwind admin starter patterns
+  if (/\bmenu-item\b|\bmenu-dropdown-item\b|\bmenu-group-title\b|\bmenu-item-arrow\b|\bmenu-item-icon\b/.test(lc)) {
+    out.push("tailadmin");
+  }
+  // AdminLTE / NowUI: `.nav-link`, `.sidebar-menu` are usually styled by
+  // Bootstrap so we don't need a fallback there.
+  return out;
+}
+
+const TEMPLATE_FALLBACK_CSS = {
+  tailadmin:
+    /* Sidebar baseline so the white background appears even without style.css */
+    ".sidebar{background:#ffffff;}" +
+    /* Top-level menu row: icon + label + chevron flow in a single line */
+    ".menu-item{display:flex;align-items:center;gap:0.75rem;padding:0.5rem 0.75rem;border-radius:0.5rem;font-size:0.875rem;font-weight:500;color:rgb(105,122,142);text-decoration:none;line-height:1.25rem;}" +
+    ".menu-item-active{background:rgba(54,116,255,0.08);color:rgb(54,116,255);}" +
+    ".menu-item-inactive{color:rgb(105,122,142);}" +
+    ".menu-item-icon-active,.menu-item-icon-inactive{width:24px;height:24px;flex:0 0 24px;}" +
+    ".menu-item-icon-active{color:rgb(54,116,255);}" +
+    ".menu-item-icon-inactive{color:rgb(105,122,142);}" +
+    ".menu-item-text{flex:1 1 auto;min-width:0;}" +
+    ".menu-item-arrow,.menu-item-arrow-active,.menu-item-arrow-inactive{width:20px;height:20px;flex:0 0 20px;color:rgb(105,122,142);}" +
+    ".menu-item-arrow-active{transform:rotate(180deg);}" +
+    /* Submenu list */
+    ".menu-dropdown{margin-top:0.5rem;display:flex;flex-direction:column;gap:0.125rem;padding-left:2.25rem;list-style:none;}" +
+    ".menu-dropdown-item{display:flex;align-items:center;justify-content:space-between;padding:0.375rem 0.75rem;border-radius:0.375rem;font-size:0.875rem;font-weight:500;color:rgb(105,122,142);text-decoration:none;}" +
+    ".menu-dropdown-item-active{color:rgb(54,116,255);}" +
+    ".menu-dropdown-item-inactive{color:rgb(105,122,142);}" +
+    /* "New" / "Pro" pill badges on submenu rows */
+    ".menu-dropdown-badge{display:inline-block;background:rgb(229,231,235);color:rgb(75,85,99);padding:0.125rem 0.5rem;border-radius:9999px;font-size:0.6875rem;font-weight:500;margin-left:auto;}" +
+    ".menu-dropdown-badge-inactive{background:rgb(229,231,235);color:rgb(75,85,99);}" +
+    ".menu-dropdown-badge-active{background:rgb(54,116,255);color:#ffffff;}" +
+    /* Section headers ("MENU", "SUPPORT", "OTHERS") */
+    ".menu-group-title{display:block;font-size:0.75rem;font-weight:500;text-transform:uppercase;letter-spacing:0.05em;color:rgb(156,163,175);padding:0 0.75rem;}" +
+    ".menu-group-icon{display:none;}" +
+    /* Common card-ish containers that often live in the same template */
+    ".card{background:#ffffff;border:1px solid rgb(229,231,235);border-radius:0.75rem;}" +
+    "",
+};
+
+function buildTemplateFallbackCss(html) {
+  const tags = detectTemplateFallbacks(html);
+  if (!tags.length) return { css: "", tags: [] };
+  let css = "";
+  for (const t of tags) {
+    if (TEMPLATE_FALLBACK_CSS[t]) css += TEMPLATE_FALLBACK_CSS[t];
+  }
+  if (!css) return { css: "", tags: [] };
+  return {
+    css: "<style data-source='template-fallback' data-tags='" + tags.join(",") + "'>" + css + "</style>",
+    tags: tags,
+  };
+}
+
 function resolveLibrariesForHtml(html, opts) {
   const trimmed = (html || "").trim();
   const hasFullDoc = /^<!doctype|^<html/i.test(trimmed);
@@ -229,4 +295,6 @@ module.exports = {
   resolveLibrariesForHtml,
   isIconElement,
   iconSetFromClasses,
+  buildTemplateFallbackCss,
+  detectTemplateFallbacks,
 };

@@ -4,6 +4,7 @@ const {
   resolveLibrariesForHtml,
   isIconElement,
   iconSetFromClasses,
+  buildTemplateFallbackCss,
 } = require("./libAssets");
 
 async function captureFromHtml(html, options) {
@@ -13,6 +14,11 @@ async function captureFromHtml(html, options) {
   const multiView = opts.multiView !== false;
   const viewSelector = opts.viewSelector || ".view-section";
   const baseUrl = normalizeBaseUrl(opts.baseUrl);
+  const extraCss = opts.extraCss || null;
+
+  // Scan for <link rel="stylesheet"> with non-absolute hrefs — those can't
+  // load from inside the srcdoc iframe and the user usually doesn't know.
+  const unreachableStylesheets = collectUnreachableStylesheets(html, baseUrl);
 
   const iframe = document.createElement("iframe");
   // Width is fixed by both attribute and CSS so the inner viewport reports
@@ -27,7 +33,14 @@ async function captureFromHtml(html, options) {
   document.body.appendChild(iframe);
 
   const libs = resolveLibrariesForHtml(html, options);
-  const wrapped = wrapHtml(html, { showHiddenMenus, libs, baseUrl });
+  const fallback = buildTemplateFallbackCss(html);
+  const wrapped = wrapHtml(html, {
+    showHiddenMenus,
+    libs,
+    baseUrl,
+    extraCss,
+    templateFallbackCss: fallback.css,
+  });
 
   // Longer default wait when external CSS/font CDNs were injected — icon
   // webfonts (Bootstrap Icons, Font Awesome) can take 1-2s to download
@@ -39,7 +52,7 @@ async function captureFromHtml(html, options) {
   await new Promise((resolve) => {
     iframe.onload = () => resolve();
     iframe.srcdoc = wrapped;
-    setTimeout(resolve, 8000);
+    setTimeout(resolve, 12000);
   });
 
   await new Promise((r) => setTimeout(r, waitMs));
@@ -49,6 +62,16 @@ async function captureFromHtml(html, options) {
   if (!doc || !win) {
     document.body.removeChild(iframe);
     throw new Error("Iframe did not initialize");
+  }
+
+  // Tailwind JIT (cdn.tailwindcss.com) scans the document at load time and
+  // generates CSS. Big pages take several seconds. We poll a probe element
+  // with a known Tailwind class until its computed style reflects Tailwind
+  // having applied. Without this, big TailAdmin-style pages capture as
+  // unstyled walls of text because the walker runs before any class
+  // produces CSS rules.
+  if (libs.tailwind) {
+    await waitForTailwind(doc, win, 8000);
   }
 
   // Wait for icon webfonts to finish loading so ::before content resolves.
@@ -90,7 +113,34 @@ async function captureFromHtml(html, options) {
 
   document.body.removeChild(iframe);
 
-  return { screens, libraries: libs };
+  return {
+    screens,
+    libraries: libs,
+    unreachableStylesheets,
+    templateFallbacks: fallback.tags,
+  };
+}
+
+// Scan the raw HTML for <link rel="stylesheet"> hrefs that the iframe will
+// not be able to resolve (i.e. relative paths when no Base URL was set,
+// and absolute paths that are not http(s) URIs). Returns an array of
+// hrefs that should be brought to the user's attention.
+function collectUnreachableStylesheets(html, baseUrl) {
+  const out = [];
+  if (!html) return out;
+  const re = /<link\b[^>]*\brel\s*=\s*["']?stylesheet["']?[^>]*>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const tag = m[0];
+    const hrefMatch = tag.match(/\bhref\s*=\s*["']([^"']+)["']/i);
+    if (!hrefMatch) continue;
+    const href = hrefMatch[1].trim();
+    if (!href) continue;
+    if (/^(data:|https?:|\/\/)/i.test(href)) continue; // absolute / data — works
+    if (baseUrl) continue; // we'll try to resolve via Base URL
+    out.push(href);
+  }
+  return out;
 }
 
 async function captureOne(doc, win, width, pageBg, meta) {
@@ -129,10 +179,21 @@ function wrapHtml(html, opts) {
   const showHiddenMenus = !opts || opts.showHiddenMenus !== false;
   const libs = (opts && opts.libs) || resolveLibrariesForHtml(trimmed, opts);
   const baseUrl = opts && opts.baseUrl;
+  const extraCss = opts && opts.extraCss;
+  // Tagged-template fallback CSS (e.g. TailAdmin's .menu-item baseline) is
+  // pre-built upstream by buildTemplateFallbackCss and arrives as a full
+  // <style> tag string. Inject it AFTER CDNs (so utility classes resolve)
+  // and BEFORE user extraCss (so users can override).
+  const templateFallbackCss = (opts && opts.templateFallbackCss) || "";
 
   const forceMenusCss = buildMenuForceCss(showHiddenMenus);
   const cdnTags = buildCdnHeadTags(libs);
   const baseStyle = "<style>body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;}</style>";
+  // User-supplied CSS goes LAST so it can override CDN defaults. Tailwind
+  // CDN's JIT compiles `@apply` directives at runtime, so pasting a snippet
+  // that uses `.menu-item { @apply flex items-center ... }` works as long
+  // as the textarea content is present when the iframe boots.
+  const extraStyleTag = extraCss ? ("<style data-source='user-extra-css'>" + String(extraCss) + "</style>") : "";
 
   // <base href> makes the browser resolve every relative URL (img src,
   // background-image url(...), link href, etc.) against the supplied path.
@@ -140,7 +201,7 @@ function wrapHtml(html, opts) {
   // and the request fails.
   const baseTag = baseUrl ? "<base href=\"" + escapeAttr(baseUrl) + "\">" : "";
 
-  const headInject = baseTag + forceMenusCss + cdnTags + baseStyle;
+  const headInject = baseTag + forceMenusCss + cdnTags + baseStyle + templateFallbackCss + extraStyleTag;
 
   const hasHtml = /^<!doctype|^<html/i.test(trimmed);
   if (hasHtml) {
@@ -204,6 +265,29 @@ async function waitForFonts(doc, win, maxMs) {
   await new Promise((r) => setTimeout(r, 80));
 }
 
+// Poll until Tailwind JIT (cdn.tailwindcss.com) has produced CSS for known
+// classes. We append a hidden probe with `class="hidden"` (display:none)
+// and `class="hidden flex"` (the later flex wins → display:flex once
+// compiled), and wait until getComputedStyle reflects a real Tailwind
+// rule rather than the browser default.
+async function waitForTailwind(doc, win, maxMs) {
+  if (!doc || !win) return;
+  const probe = doc.createElement("div");
+  probe.className = "hidden";
+  probe.style.cssText = "position:absolute;top:-99999px;left:-99999px;pointer-events:none;";
+  try { doc.body.appendChild(probe); } catch (e) { return; }
+  const deadline = Date.now() + (maxMs || 5000);
+  try {
+    while (Date.now() < deadline) {
+      const display = win.getComputedStyle(probe).display;
+      if (display === "none") return; // tailwind `.hidden` rule has applied
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  } finally {
+    try { probe.remove(); } catch (e) { /* */ }
+  }
+}
+
 // Tags we always materialize as a group/section even when they have no
 // own visible styling. Helps reproduce the source structure in Figma.
 const SEMANTIC_CONTAINER_TAGS = new Set([
@@ -261,6 +345,26 @@ function walk(el, containerRect, win, atoms, parentId, nextId) {
 
   const rect = el.getBoundingClientRect();
   if (rect.width === 0 && rect.height === 0 && tag !== "br") return;
+
+  // Collapsed accordion / dropdown panels: `max-height: 0; overflow:
+  // hidden;` (or `height: 0` with overflow hidden). The container has a
+  // non-zero width but zero rendered height and is clipping its kids.
+  // We must stop walking here — otherwise every "closed" sub-menu spills
+  // its <li>s into the capture, producing the flat list of menu items
+  // the user is seeing in Figma. The same goes for horizontally
+  // collapsed panels (rare, but possible).
+  if (tag !== "br") {
+    const overflow = cs.overflow;
+    const overflowY = cs.overflowY;
+    const overflowX = cs.overflowX;
+    const hidesY = overflow === "hidden" || overflowY === "hidden" || overflowY === "clip" || overflow === "clip";
+    const hidesX = overflow === "hidden" || overflowX === "hidden" || overflowX === "clip" || overflow === "clip";
+    const yIsZero = rect.height === 0 || cs.maxHeight === "0px" || cs.height === "0px";
+    const xIsZero = rect.width === 0 || cs.maxWidth === "0px" || cs.width === "0px";
+    if ((hidesY && yIsZero) || (hidesX && xIsZero)) {
+      return;
+    }
+  }
 
   const classes = classListOf(el);
   const myId = nextId();
@@ -489,6 +593,30 @@ function extractBoxStyle(el, cs, rect, containerRect, tag, win) {
     };
   }
 
+  // Inline <svg> markup goes to Figma as a real vector via createNodeFromSvg
+  // — NOT through the icon-font glyph path which only works for FA/BI icon
+  // sets. We still also keep the icon path for elements like <i class="fa
+  // fa-star"> which never have inline children.
+  if (tag === "svg") {
+    let svgString = null;
+    try {
+      const serializer = new XMLSerializer();
+      svgString = serializer.serializeToString(el);
+    } catch (e) {
+      try { svgString = el.outerHTML; } catch (e2) { svgString = null; }
+    }
+    return {
+      type: "svg",
+      tag,
+      x, y, w, h,
+      svgString,
+      color: cs.color,
+      bg,
+      opacity,
+      radii,
+    };
+  }
+
   if (isIconElement(el)) {
     const classNames = el.getAttribute("class") || "";
     const iconData = captureIconGlyph(el, tag, cs, win);
@@ -545,6 +673,44 @@ async function loadImageBytes(atom) {
 
   if (atom.src) candidates.push(atom.src);
   if (atom.srcAttr && atom.srcAttr !== atom.src) candidates.push(atom.srcAttr);
+
+  // SVG fast path: <img src="*.svg"> goes to Figma as vectors via
+  // createNodeFromSvg, not as raster bytes. We try to fetch the file as
+  // text and upgrade the atom to type "svg".
+  const looksLikeSvg = (u) => /\.svg(\?|#|$)/i.test(u) || /^data:image\/svg/i.test(u);
+  for (const url of candidates) {
+    if (!url || !looksLikeSvg(url)) continue;
+    if (/^data:image\/svg\+xml[;,]/i.test(url)) {
+      // data URI: decode inline.
+      try {
+        const comma = url.indexOf(",");
+        let payload = url.slice(comma + 1);
+        const header = url.slice(0, comma);
+        const text = header.includes(";base64")
+          ? decodeURIComponent(escape(atob(payload)))
+          : decodeURIComponent(payload);
+        if (text.includes("<svg")) {
+          atom.type = "svg";
+          atom.svgString = text;
+          atom.resolvedSrc = url;
+          return;
+        }
+      } catch (e) { /* fall through */ }
+      continue;
+    }
+    try {
+      const resp = await fetch(url, { mode: "cors" });
+      if (resp.ok) {
+        const text = await resp.text();
+        if (text.includes("<svg")) {
+          atom.type = "svg";
+          atom.svgString = text;
+          atom.resolvedSrc = url;
+          return;
+        }
+      }
+    } catch (e) { /* fall through to byte fetch */ }
+  }
 
   for (const url of candidates) {
     if (!url || tried.has(url)) continue;
@@ -617,8 +783,35 @@ function imageUrlToBytesViaCanvas(url) {
 
 async function loadBgImageBytes(atom) {
   if (!atom.bgImageUrls || !atom.bgImageUrls.length) return;
+  const isSvgUrl = (u) => /\.svg(\?|#|$)/i.test(u) || /^data:image\/svg/i.test(u);
   for (const url of atom.bgImageUrls) {
     if (!url) continue;
+
+    // CSS background-image with an SVG: fetch as text and stash the
+    // markup on the atom so the renderer can paint it as a vector
+    // overlay rather than a raster fill.
+    if (isSvgUrl(url)) {
+      try {
+        let text = null;
+        if (/^data:image\/svg\+xml[;,]/i.test(url)) {
+          const comma = url.indexOf(",");
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          text = header.includes(";base64")
+            ? decodeURIComponent(escape(atob(payload)))
+            : decodeURIComponent(payload);
+        } else {
+          const resp = await fetch(url, { mode: "cors" });
+          if (resp.ok) text = await resp.text();
+        }
+        if (text && text.includes("<svg")) {
+          atom.bgSvgString = text;
+          atom.bgImageUrl = url;
+          return;
+        }
+      } catch (e) { /* fall through to byte fetch */ }
+    }
+
     if (url.startsWith("data:")) {
       const bytes = dataUrlToBytes(url);
       if (bytes) {

@@ -7,6 +7,7 @@ const showHiddenMenusEl = document.getElementById("showHiddenMenus");
 const multiViewEl = document.getElementById("multiView");
 const useAutoLayoutEl = document.getElementById("useAutoLayout");
 const baseUrlEl = document.getElementById("baseUrl");
+const extraCssEl = document.getElementById("extraCss");
 
 function formatLibrariesNote(libs) {
   if (!libs) return "";
@@ -84,6 +85,7 @@ convertBtn.onclick = async () => {
   // coordinates, which matches the browser pixel-for-pixel.
   const useAutoLayout = useAutoLayoutEl ? useAutoLayoutEl.checked : false;
   const baseUrl = baseUrlEl ? (baseUrlEl.value || "").trim() : "";
+  const extraCss = extraCssEl ? (extraCssEl.value || "") : "";
 
   // Detect relative image paths in the source and warn if no base URL.
   const relImgPaths = collectRelativeImgPaths(html);
@@ -104,6 +106,7 @@ convertBtn.onclick = async () => {
       showHiddenMenus,
       multiView,
       baseUrl: baseUrl || null,
+      extraCss: extraCss || null,
     });
   } catch (err) {
     setStatus("Capture failed: " + (err && err.message ? err.message : err), true);
@@ -130,9 +133,22 @@ convertBtn.onclick = async () => {
       (imgFailed ? " (" + imgFailed + " failed — check Base URL)." : ".")
     : "";
 
+  const missingCss = captured.unreachableStylesheets || [];
+  const fallbacks = captured.templateFallbacks || [];
+  const fallbackNote = fallbacks.length
+    ? " Applied fallback styles for " + fallbacks.join(", ") + " classes."
+    : "";
+  const cssNote = missingCss.length
+    ? " ⚠ Could not load stylesheet(s): " + missingCss.slice(0, 3).join(", ") +
+      (missingCss.length > 3 ? " (+" + (missingCss.length - 3) + " more)" : "") +
+      (fallbacks.length
+        ? " Paste their contents in 'Additional CSS' for exact match."
+        : " Set Base URL or paste their contents in 'Additional CSS'.")
+    : "";
+
   setStatus(
     "Captured " + screens.length + " screen(s), " + totalAtoms + " atoms." +
-      imgNote + libNote + " Sending to Figma...",
+      imgNote + cssNote + fallbackNote + libNote + " Sending to Figma...",
     false
   );
 

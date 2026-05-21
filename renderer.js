@@ -101,10 +101,9 @@ async function loadAllFonts() {
   await figma.loadFontAsync({ family: "Inter", style: "Regular" });
 }
 
-// ----- FontAwesome support -----
-// Map captured ::before font-family / font-weight to the Figma font that
-// actually exists on the user's machine. We probe each style once and cache
-// what's available so the renderer can degrade gracefully.
+const { iconSetFromClasses } = require("./libAssets");
+
+// ----- Icon font support (Font Awesome, Bootstrap Icons, Glyphicons) -----
 const FA_FAMILY_CANDIDATES = [
   "Font Awesome 6 Free",
   "Font Awesome 6 Pro",
@@ -115,24 +114,50 @@ const FA_FAMILY_CANDIDATES = [
 ];
 const FA_STYLE_CANDIDATES = ["Solid", "Regular", "Light", "Thin", "Brands"];
 
-let _faFontsPromise = null;
-const _faAvailable = {};
+const BI_FAMILY_CANDIDATES = ["bootstrap-icons", "Bootstrap Icons"];
+const BI_STYLE_CANDIDATES = ["Regular", "Normal"];
 
-async function loadFontAwesomeFonts() {
-  if (_faFontsPromise) return _faFontsPromise;
-  _faFontsPromise = (async () => {
-    for (const family of FA_FAMILY_CANDIDATES) {
-      for (const style of FA_STYLE_CANDIDATES) {
-        try {
-          await figma.loadFontAsync({ family, style });
-          if (!_faAvailable[family]) _faAvailable[family] = [];
-          _faAvailable[family].push(style);
-        } catch (e) { /* font/style not installed */ }
-      }
+const GLYPH_FAMILY_CANDIDATES = ["Glyphicons Halflings"];
+const GLYPH_STYLE_CANDIDATES = ["Regular"];
+
+const _iconFontsAvailable = { fa: {}, bi: {}, glyph: {} };
+
+async function probeFontFamilies(families, styles, bucket) {
+  for (const family of families) {
+    for (const style of styles) {
+      try {
+        await figma.loadFontAsync({ family, style });
+        if (!bucket[family]) bucket[family] = [];
+        if (bucket[family].indexOf(style) < 0) bucket[family].push(style);
+      } catch (e) { /* not installed */ }
     }
-    return _faAvailable;
-  })();
-  return _faFontsPromise;
+  }
+}
+
+async function loadIconFonts(setsNeeded) {
+  const tasks = [];
+  if (!setsNeeded || setsNeeded.has("fontawesome") || setsNeeded.has("unknown")) {
+    tasks.push(probeFontFamilies(FA_FAMILY_CANDIDATES, FA_STYLE_CANDIDATES, _iconFontsAvailable.fa));
+  }
+  if (!setsNeeded || setsNeeded.has("bootstrap-icons")) {
+    tasks.push(probeFontFamilies(BI_FAMILY_CANDIDATES, BI_STYLE_CANDIDATES, _iconFontsAvailable.bi));
+  }
+  if (!setsNeeded || setsNeeded.has("glyphicons")) {
+    tasks.push(probeFontFamilies(GLYPH_FAMILY_CANDIDATES, GLYPH_STYLE_CANDIDATES, _iconFontsAvailable.glyph));
+  }
+  await Promise.all(tasks);
+  return _iconFontsAvailable;
+}
+
+function pickFromBucket(bucket, familyOrder, preferredStyle) {
+  for (const family of familyOrder) {
+    const styles = bucket[family];
+    if (!styles || !styles.length) continue;
+    const style =
+      preferredStyle && styles.indexOf(preferredStyle) >= 0 ? preferredStyle : styles[0];
+    return { family, style };
+  }
+  return null;
 }
 
 function pickFontAwesomeFont(capturedFamily, capturedWeight) {
@@ -145,12 +170,7 @@ function pickFontAwesomeFont(capturedFamily, capturedWeight) {
 
   const familyOrder = isBrands
     ? ["Font Awesome 6 Brands", "Font Awesome 5 Brands"]
-    : [
-        "Font Awesome 6 Free",
-        "Font Awesome 6 Pro",
-        "Font Awesome 5 Free",
-        "FontAwesome",
-      ];
+    : ["Font Awesome 6 Free", "Font Awesome 6 Pro", "Font Awesome 5 Free", "FontAwesome"];
 
   let preferredStyle = "Solid";
   if (isBrands) preferredStyle = "Brands";
@@ -158,13 +178,42 @@ function pickFontAwesomeFont(capturedFamily, capturedWeight) {
   else if (wantLight) preferredStyle = "Light";
   else if (wantRegular) preferredStyle = "Regular";
 
-  for (const family of familyOrder) {
-    const styles = _faAvailable[family];
-    if (!styles || !styles.length) continue;
-    const style = styles.indexOf(preferredStyle) >= 0 ? preferredStyle : styles[0];
-    return { family, style };
+  return pickFromBucket(_iconFontsAvailable.fa, familyOrder, preferredStyle);
+}
+
+function pickBootstrapIconsFont() {
+  return pickFromBucket(_iconFontsAvailable.bi, BI_FAMILY_CANDIDATES, "Regular")
+    || pickFromBucket(_iconFontsAvailable.bi, BI_FAMILY_CANDIDATES, "Normal");
+}
+
+function pickGlyphiconsFont() {
+  return pickFromBucket(_iconFontsAvailable.glyph, GLYPH_FAMILY_CANDIDATES, "Regular");
+}
+
+function pickIconFont(atom) {
+  const set =
+    atom.iconSet || iconSetFromClasses(atom.classNames, atom.fontFamily);
+  if (set === "bootstrap-icons") return pickBootstrapIconsFont();
+  if (set === "glyphicons") return pickGlyphiconsFont();
+  if (set === "fontawesome") return pickFontAwesomeFont(atom.fontFamily, atom.fontWeight);
+  // Unknown: try BI, then FA, then Glyphicons
+  return (
+    pickBootstrapIconsFont() ||
+    pickFontAwesomeFont(atom.fontFamily, atom.fontWeight) ||
+    pickGlyphiconsFont()
+  );
+}
+
+function collectIconSetsFromScreens(screens) {
+  const sets = new Set();
+  for (const screen of screens || []) {
+    for (const a of screen.atoms || []) {
+      if (a && a.type === "icon" && a.glyph) {
+        sets.add(a.iconSet || iconSetFromClasses(a.classNames, a.fontFamily));
+      }
+    }
   }
-  return null;
+  return sets;
 }
 
 function setFill(node, color) {
@@ -450,10 +499,9 @@ async function renderInput(parent, atom) {
 }
 
 async function renderIcon(parent, atom) {
-  // Primary path: we captured the FontAwesome glyph from ::before, so render
-  // it as real text using the matching FA font if installed.
+  // Primary path: icon font glyph from ::before (FA, Bootstrap Icons, Glyphicons).
   if (atom.glyph) {
-    const picked = pickFontAwesomeFont(atom.fontFamily, atom.fontWeight);
+    const picked = pickIconFont(atom);
     if (picked) {
       try {
         const txt = figma.createText();
@@ -519,10 +567,8 @@ async function renderAtoms(atoms, width, height, background) {
 async function renderScreens(screens) {
   await loadAllFonts();
 
-  const hasIconGlyphs = screens.some(
-    (s) => s.atoms && s.atoms.some((a) => a && a.type === "icon" && a.glyph)
-  );
-  if (hasIconGlyphs) await loadFontAwesomeFonts();
+  const iconSets = collectIconSetsFromScreens(screens);
+  if (iconSets.size) await loadIconFonts(iconSets);
 
   // Compute a base Y below any pre-existing content so we don't overlap.
   let baseY = 0;

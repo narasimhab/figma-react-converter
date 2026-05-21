@@ -1,3 +1,11 @@
+const {
+  buildCdnHeadTags,
+  buildMenuForceCss,
+  resolveLibrariesForHtml,
+  isIconElement,
+  iconSetFromClasses,
+} = require("./libAssets");
+
 async function captureFromHtml(html, options) {
   const opts = options || {};
   const width = opts.width || 1440;
@@ -13,7 +21,8 @@ async function captureFromHtml(html, options) {
     "px;height:1px;border:0;visibility:hidden;";
   document.body.appendChild(iframe);
 
-  const wrapped = wrapHtml(html, { showHiddenMenus });
+  const libs = resolveLibrariesForHtml(html, options);
+  const wrapped = wrapHtml(html, { showHiddenMenus, libs });
 
   await new Promise((resolve) => {
     iframe.onload = () => resolve();
@@ -66,7 +75,7 @@ async function captureFromHtml(html, options) {
 
   document.body.removeChild(iframe);
 
-  return { screens };
+  return { screens, libraries: libs };
 }
 
 async function captureOne(doc, win, width, pageBg, meta) {
@@ -102,40 +111,31 @@ function viewName(viewEl) {
 function wrapHtml(html, opts) {
   const trimmed = (html || "").trim();
   const showHiddenMenus = !opts || opts.showHiddenMenus !== false;
+  const libs = (opts && opts.libs) || resolveLibrariesForHtml(trimmed, opts);
+  const forceMenusCss = buildMenuForceCss(showHiddenMenus);
+  const cdnTags = buildCdnHeadTags(libs);
+  const baseStyle = "<style>body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;}</style>";
 
-  // Style override that forces commonly-hidden menu containers to render.
-  // Without this, every CSS :hover dropdown is computed as display:none and
-  // never reaches the walker, so menu items go missing in the Figma output.
-  // Also disables transitions/animations so multi-view switching is instant
-  // and layout values don't read mid-animation.
-  const forceMenusCss =
-    "<style>" +
-    "*,*::before,*::after{animation:none!important;transition:none!important;}" +
-    (showHiddenMenus
-      ? ".dropdown,.submenu,.flyout,.menu-panel,.nav-dropdown,.has-dropdown>ul," +
-        "[class*='dropdown-menu'],[data-dropdown],[role='menu'],[aria-haspopup='true']+ul," +
-        ".nav-item:hover .dropdown,.group:hover .dropdown" +
-        "{display:block!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important;}"
-      : "") +
-    "</style>";
+  const headInject = forceMenusCss + cdnTags + baseStyle;
 
   const hasHtml = /^<!doctype|^<html/i.test(trimmed);
   if (hasHtml) {
-    // Inject the override into the existing <head>; fall back to prepend.
-    if (/<head[^>]*>/i.test(trimmed)) {
-      return trimmed.replace(/<head([^>]*)>/i, "<head$1>" + forceMenusCss);
+    let out = trimmed;
+    if (/<head[^>]*>/i.test(out)) {
+      out = out.replace(/<head([^>]*)>/i, "<head$1>" + headInject);
+    } else {
+      out = headInject + out;
     }
-    return forceMenusCss + trimmed;
+    // Full documents may reference Bootstrap/BI in <head> already; inject only
+    // missing CDN tags when detection asked for them (buildCdnHeadTags handles that).
+    return out;
   }
   if (/^<body/i.test(trimmed)) {
-    return "<!doctype html><html><head><meta charset='utf-8'>" + forceMenusCss + "</head>" + trimmed + "</html>";
+    return "<!doctype html><html><head><meta charset='utf-8'>" + headInject + "</head>" + trimmed + "</html>";
   }
   return (
     "<!doctype html><html><head><meta charset='utf-8'>" +
-    "<script src='https://cdn.tailwindcss.com'></script>" +
-    "<link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css'/>" +
-    "<style>body{margin:0;font-family:Inter,system-ui,sans-serif;}</style>" +
-    forceMenusCss +
+    headInject +
     "</head><body>" +
     trimmed +
     "</body></html>"
@@ -207,6 +207,38 @@ function captureTextNode(textNode, text, parentCs, containerRect, atoms) {
   });
 }
 
+function captureIconGlyph(el, tag, cs, win) {
+  let glyph = null;
+  let fontFamily = cs.fontFamily;
+  let fontWeight = cs.fontWeight;
+  let fontSize = parseFloat(cs.fontSize) || 14;
+
+  if (tag !== "svg" && win) {
+    try {
+      const before = win.getComputedStyle(el, "::before");
+      const content = before && before.content;
+      if (content && content !== "none" && content !== "normal" && content !== '""' && content !== "''") {
+        let s = content;
+        if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+          s = s.slice(1, -1);
+        }
+        s = s.replace(/\\([0-9a-fA-F]{1,6})\s?/g, (_, hex) =>
+          String.fromCodePoint(parseInt(hex, 16))
+        );
+        if (s) glyph = s;
+      }
+      if (before) {
+        if (before.fontFamily) fontFamily = before.fontFamily;
+        if (before.fontWeight) fontWeight = before.fontWeight;
+        const beforeSize = parseFloat(before.fontSize);
+        if (beforeSize) fontSize = beforeSize;
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  return { glyph, fontFamily, fontWeight, fontSize };
+}
+
 function extractBoxStyle(el, cs, rect, containerRect, tag, win) {
   const x = rect.left - containerRect.left;
   const y = rect.top - containerRect.top;
@@ -271,51 +303,21 @@ function extractBoxStyle(el, cs, rect, containerRect, tag, win) {
     };
   }
 
-  if (tag === "i" || tag === "svg") {
+  if (isIconElement(el)) {
     const classNames = el.getAttribute("class") || "";
-    let glyph = null;
-    let glyphFontFamily = cs.fontFamily;
-    let glyphFontWeight = cs.fontWeight;
-    let glyphFontSize = parseFloat(cs.fontSize) || 14;
-
-    // FontAwesome / Material Icons / Bootstrap Icons inject the glyph via the
-    // ::before pseudo-element's `content` property. Read it explicitly.
-    if (tag === "i" && win) {
-      try {
-        const before = win.getComputedStyle(el, "::before");
-        const content = before && before.content;
-        if (content && content !== "none" && content !== "normal" && content !== '""' && content !== "''") {
-          let s = content;
-          if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-            s = s.slice(1, -1);
-          }
-          // CSS escape sequences (e.g. "\f0f3") arrive pre-decoded as the
-          // actual codepoint in modern browsers, but handle the raw form too.
-          s = s.replace(/\\([0-9a-fA-F]{1,6})\s?/g, (_, hex) =>
-            String.fromCodePoint(parseInt(hex, 16))
-          );
-          if (s) glyph = s;
-        }
-        if (before) {
-          if (before.fontFamily) glyphFontFamily = before.fontFamily;
-          if (before.fontWeight) glyphFontWeight = before.fontWeight;
-          const beforeSize = parseFloat(before.fontSize);
-          if (beforeSize) glyphFontSize = beforeSize;
-        }
-      } catch (e) { /* ignore */ }
-    }
-
+    const iconData = captureIconGlyph(el, tag, cs, win);
     return {
       type: "icon",
       tag,
       x, y, w, h,
       color: cs.color,
       bg,
-      fontFamily: glyphFontFamily,
-      fontWeight: glyphFontWeight,
-      fontSize: glyphFontSize,
-      glyph,
+      fontFamily: iconData.fontFamily,
+      fontWeight: iconData.fontWeight,
+      fontSize: iconData.fontSize,
+      glyph: iconData.glyph,
       classNames,
+      iconSet: iconSetFromClasses(classNames, iconData.fontFamily),
     };
   }
 

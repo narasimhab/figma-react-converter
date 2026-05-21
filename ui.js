@@ -6,6 +6,17 @@ const statusEl = document.getElementById("status");
 const showHiddenMenusEl = document.getElementById("showHiddenMenus");
 const multiViewEl = document.getElementById("multiView");
 
+function formatLibrariesNote(libs) {
+  if (!libs) return "";
+  const names = [];
+  if (libs.bootstrap || (libs.linked && libs.linked.bootstrap)) names.push("Bootstrap CSS");
+  if (libs.bootstrapIcons || (libs.linked && libs.linked.bootstrapIcons)) names.push("Bootstrap Icons");
+  if (libs.fontAwesome || (libs.linked && libs.linked.fontAwesome)) names.push("Font Awesome");
+  if (libs.tailwind || (libs.linked && libs.linked.tailwind)) names.push("Tailwind");
+  if (!names.length) return "";
+  return " Libraries: " + names.join(", ") + ".";
+}
+
 function setStatus(message, isError) {
   if (!statusEl) return;
   statusEl.textContent = message || "";
@@ -68,8 +79,9 @@ convertBtn.onclick = async () => {
 
   const screens = captured.screens || [];
   const totalAtoms = screens.reduce((n, s) => n + (s.atoms ? s.atoms.length : 0), 0);
+  const libNote = formatLibrariesNote(captured.libraries);
   setStatus(
-    "Captured " + screens.length + " screen(s), " + totalAtoms + " atoms. Sending to Figma...",
+    "Captured " + screens.length + " screen(s), " + totalAtoms + " atoms." + libNote + " Sending to Figma...",
     false
   );
 

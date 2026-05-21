@@ -294,9 +294,12 @@ function gradientTransform(direction) {
   return [[1, 0, 0], [0, 1, 0]];
 }
 
-function applyBackground(frame, bg, bgImage) {
+function applyBackground(frame, atom) {
   if (!("fills" in frame)) return;
+  const bg = atom && atom.bg;
+  const bgImage = atom && atom.bgImage;
   const fills = [];
+
   const solid = parseCssColor(bg);
   if (solid && solid.a > 0) {
     fills.push({
@@ -305,19 +308,48 @@ function applyBackground(frame, bg, bgImage) {
       opacity: solid.a,
     });
   }
+
+  // CSS background-image: url(...) — bytes loaded by domCapture.loadBgImageBytes
+  if (atom && atom.bgImageBytes) {
+    try {
+      const bytes =
+        atom.bgImageBytes instanceof Uint8Array
+          ? atom.bgImageBytes
+          : new Uint8Array(atom.bgImageBytes);
+      const image = figma.createImage(bytes);
+      const sizeStr = String(atom.bgSize || "").toLowerCase();
+      const repeatStr = String(atom.bgRepeat || "").toLowerCase();
+      let scaleMode = "FILL";
+      if (sizeStr.includes("contain")) scaleMode = "FIT";
+      else if (sizeStr.includes("cover")) scaleMode = "FILL";
+      else if (repeatStr && repeatStr !== "no-repeat") scaleMode = "TILE";
+      fills.push({ type: "IMAGE", scaleMode, imageHash: image.hash });
+    } catch (e) {
+      /* image decode failed - keep solid/gradient fills */
+    }
+  }
+
   const gradient = parseBackgroundGradient(bgImage);
   if (gradient) fills.push(gradient);
-  frame.fills = fills;
+
+  if (fills.length === 0) {
+    frame.fills = [];
+  } else {
+    frame.fills = fills;
+  }
 }
 
 async function renderBox(parent, atom) {
   const frame = figma.createFrame();
-  frame.name = atom.tag || "div";
+  let label = atom.tag || "div";
+  if (atom.onclickTarget) label += " \u2192 " + atom.onclickTarget;
+  else if (atom.href) label += " \u2192 " + atom.href;
+  frame.name = label;
   frame.x = Math.round(atom.x);
   frame.y = Math.round(atom.y);
   frame.resize(Math.max(1, Math.round(atom.w)), Math.max(1, Math.round(atom.h)));
   frame.clipsContent = false;
-  applyBackground(frame, atom.bg, atom.bgImage);
+  applyBackground(frame, atom);
   applyCorners(frame, atom.radii);
   applyBorder(frame, atom.border);
   applyShadow(frame, atom.boxShadow);
@@ -480,30 +512,105 @@ async function renderAtom(parent, atom) {
 }
 
 async function renderAtoms(atoms, width, height, background) {
-  await loadAllFonts();
-  const hasIconGlyphs = atoms.some((a) => a && a.type === "icon" && a.glyph);
-  if (hasIconGlyphs) await loadFontAwesomeFonts();
-
-  const screen = figma.createFrame();
-  screen.name = "HTML Screen";
-  screen.x = 0;
-  screen.y = 0;
-  screen.resize(Math.max(100, Math.round(width)), Math.max(100, Math.round(height)));
-  screen.clipsContent = true;
-  const bg = parseCssColor(background) || { r: 1, g: 1, b: 1, a: 1 };
-  screen.fills = [{
-    type: "SOLID",
-    color: { r: bg.r, g: bg.g, b: bg.b },
-    opacity: bg.a,
-  }];
-  figma.currentPage.appendChild(screen);
-
-  for (const atom of atoms) {
-    await renderAtom(screen, atom);
-  }
-
-  figma.viewport.scrollAndZoomIntoView([screen]);
-  return screen;
+  // Backwards-compatible single-screen entry point.
+  return renderScreens([{ name: "screen", atoms, width, height, background }]);
 }
 
-module.exports = { renderAtoms };
+async function renderScreens(screens) {
+  await loadAllFonts();
+
+  const hasIconGlyphs = screens.some(
+    (s) => s.atoms && s.atoms.some((a) => a && a.type === "icon" && a.glyph)
+  );
+  if (hasIconGlyphs) await loadFontAwesomeFonts();
+
+  // Compute a base Y below any pre-existing content so we don't overlap.
+  let baseY = 0;
+  for (const child of figma.currentPage.children) {
+    if (typeof child.y === "number" && typeof child.height === "number") {
+      baseY = Math.max(baseY, child.y + child.height + 200);
+    }
+  }
+
+  const frameByView = new Map();
+  const interactiveBindings = []; // { nodeId, target }
+  const createdFrames = [];
+
+  const GAP = 240;
+  let xOffset = 0;
+
+  for (const screen of screens) {
+    const frame = figma.createFrame();
+    const name = screen.name || "screen";
+    frame.name = "Screen: " + name;
+    frame.x = xOffset;
+    frame.y = baseY;
+    frame.resize(
+      Math.max(100, Math.round(screen.width || 1440)),
+      Math.max(100, Math.round(screen.height || 800))
+    );
+    frame.clipsContent = true;
+    const bg = parseCssColor(screen.background) || { r: 1, g: 1, b: 1, a: 1 };
+    frame.fills = [{
+      type: "SOLID",
+      color: { r: bg.r, g: bg.g, b: bg.b },
+      opacity: bg.a === undefined ? 1 : bg.a,
+    }];
+    figma.currentPage.appendChild(frame);
+
+    frameByView.set(name, frame);
+    createdFrames.push(frame);
+
+    for (const atom of screen.atoms || []) {
+      const node = await renderAtom(frame, atom);
+      if (!node) continue;
+      if (atom.onclickTarget) {
+        interactiveBindings.push({ nodeId: node.id, target: atom.onclickTarget });
+      }
+    }
+
+    xOffset += frame.width + GAP;
+  }
+
+  // Wire onclick handlers as Figma prototype reactions. In Present mode,
+  // clicking the button will navigate to the destination screen.
+  for (const binding of interactiveBindings) {
+    const dest = frameByView.get(binding.target);
+    if (!dest) continue;
+    let node;
+    try {
+      node = await figma.getNodeByIdAsync(binding.nodeId);
+    } catch (e) { continue; }
+    if (!node || !("reactions" in node)) continue;
+    try {
+      node.reactions = [{
+        trigger: { type: "ON_CLICK" },
+        action: {
+          type: "NODE",
+          destinationId: dest.id,
+          navigation: "NAVIGATE",
+          transition: {
+            type: "SMART_ANIMATE",
+            easing: { type: "EASE_IN_AND_OUT" },
+            duration: 0.3,
+          },
+          preserveScrollPosition: false,
+        },
+      }];
+    } catch (e) {
+      // Some Figma node types don't accept reactions (e.g. text). Fail soft.
+    }
+  }
+
+  // First captured screen becomes the Present-mode entry point.
+  if (createdFrames.length > 0 && "prototypeStartNode" in figma.currentPage) {
+    try {
+      figma.currentPage.prototypeStartNode = createdFrames[0];
+    } catch (e) { /* not supported in this file */ }
+  }
+
+  figma.viewport.scrollAndZoomIntoView(createdFrames);
+  return createdFrames.length;
+}
+
+module.exports = { renderAtoms, renderScreens };

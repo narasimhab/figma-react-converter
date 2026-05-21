@@ -4,6 +4,7 @@ const convertBtn = document.getElementById("convert");
 const jsxArea = document.getElementById("jsx");
 const statusEl = document.getElementById("status");
 const showHiddenMenusEl = document.getElementById("showHiddenMenus");
+const multiViewEl = document.getElementById("multiView");
 
 function setStatus(message, isError) {
   if (!statusEl) return;
@@ -49,6 +50,7 @@ convertBtn.onclick = async () => {
   }
 
   const showHiddenMenus = !showHiddenMenusEl || showHiddenMenusEl.checked;
+  const multiView = !multiViewEl || multiViewEl.checked;
 
   let captured;
   try {
@@ -56,6 +58,7 @@ convertBtn.onclick = async () => {
       width: 1440,
       waitMs: 2000,
       showHiddenMenus,
+      multiView,
     });
   } catch (err) {
     setStatus("Capture failed: " + (err && err.message ? err.message : err), true);
@@ -63,21 +66,18 @@ convertBtn.onclick = async () => {
     return;
   }
 
-  setStatus("Captured " + captured.atoms.length + " atoms. Sending to Figma...", false);
-
-  const transferables = [];
-  captured.atoms.forEach((a) => {
-    if (a.imageBytes) transferables.push(a.imageBytes.buffer);
-  });
+  const screens = captured.screens || [];
+  const totalAtoms = screens.reduce((n, s) => n + (s.atoms ? s.atoms.length : 0), 0);
+  setStatus(
+    "Captured " + screens.length + " screen(s), " + totalAtoms + " atoms. Sending to Figma...",
+    false
+  );
 
   parent.postMessage(
     {
       pluginMessage: {
         type: "renderAtoms",
-        atoms: captured.atoms,
-        width: captured.width,
-        height: captured.height,
-        background: captured.background,
+        screens,
       },
     },
     "*"

@@ -3,6 +3,8 @@ async function captureFromHtml(html, options) {
   const width = opts.width || 1440;
   const waitMs = opts.waitMs || 1800;
   const showHiddenMenus = opts.showHiddenMenus !== false;
+  const multiView = opts.multiView !== false;
+  const viewSelector = opts.viewSelector || ".view-section";
 
   const iframe = document.createElement("iframe");
   iframe.style.cssText =
@@ -28,24 +30,73 @@ async function captureFromHtml(html, options) {
     throw new Error("Iframe did not initialize");
   }
 
-  iframe.style.height = doc.documentElement.scrollHeight + "px";
-  await new Promise((r) => setTimeout(r, 300));
+  const pageBg = win.getComputedStyle(doc.body).backgroundColor;
 
+  // Multi-view mode: detect .view-section elements (or user-specified
+  // selector) and capture each one as its own screen. Each "screen" becomes
+  // a separate frame in Figma, and onclick navigateTo('X') wires up
+  // prototype reactions between them.
+  const views = multiView ? Array.from(doc.querySelectorAll(viewSelector)) : [];
+  const screens = [];
+
+  if (views.length > 0) {
+    for (let i = 0; i < views.length; i++) {
+      const view = views[i];
+
+      views.forEach((v) => v.classList.remove("active"));
+      view.classList.add("active");
+
+      // Animations/transitions are already disabled by the injected style;
+      // we still wait a tick for layout to settle.
+      await new Promise((r) => setTimeout(r, 200));
+      iframe.style.height = doc.documentElement.scrollHeight + "px";
+      await new Promise((r) => setTimeout(r, 120));
+
+      const screen = await captureOne(doc, win, width, pageBg, {
+        name: viewName(view),
+      });
+      screens.push(screen);
+    }
+  } else {
+    iframe.style.height = doc.documentElement.scrollHeight + "px";
+    await new Promise((r) => setTimeout(r, 300));
+    const screen = await captureOne(doc, win, width, pageBg, { name: "screen" });
+    screens.push(screen);
+  }
+
+  document.body.removeChild(iframe);
+
+  return { screens };
+}
+
+async function captureOne(doc, win, width, pageBg, meta) {
   const containerRect = doc.body.getBoundingClientRect();
   const pageWidth = Math.max(doc.documentElement.scrollWidth, doc.body.scrollWidth, width);
   const pageHeight = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight);
-
-  const pageBg = win.getComputedStyle(doc.body).backgroundColor;
 
   const atoms = [];
   walk(doc.body, containerRect, win, atoms);
 
   const imgAtoms = atoms.filter((a) => a.tag === "img" && a.src);
-  await Promise.all(imgAtoms.map((a) => loadImageBytes(a)));
+  const bgAtoms = atoms.filter((a) => a.bgImageUrls && a.bgImageUrls.length);
+  await Promise.all([
+    ...imgAtoms.map((a) => loadImageBytes(a)),
+    ...bgAtoms.map((a) => loadBgImageBytes(a)),
+  ]);
 
-  document.body.removeChild(iframe);
+  return {
+    name: meta.name,
+    atoms,
+    width: pageWidth,
+    height: pageHeight,
+    background: pageBg,
+  };
+}
 
-  return { atoms, width: pageWidth, height: pageHeight, background: pageBg };
+function viewName(viewEl) {
+  const id = viewEl.id || viewEl.getAttribute("data-view") || "";
+  if (id) return id.replace(/^view-/, "");
+  return "view";
 }
 
 function wrapHtml(html, opts) {
@@ -55,14 +106,18 @@ function wrapHtml(html, opts) {
   // Style override that forces commonly-hidden menu containers to render.
   // Without this, every CSS :hover dropdown is computed as display:none and
   // never reaches the walker, so menu items go missing in the Figma output.
-  const forceMenusCss = showHiddenMenus
-    ? "<style>" +
-      ".dropdown,.submenu,.flyout,.menu-panel,.nav-dropdown,.has-dropdown>ul," +
-      "[class*='dropdown-menu'],[data-dropdown],[role='menu'],[aria-haspopup='true']+ul," +
-      ".nav-item:hover .dropdown,.group:hover .dropdown" +
-      "{display:block!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important;}" +
-      "</style>"
-    : "";
+  // Also disables transitions/animations so multi-view switching is instant
+  // and layout values don't read mid-animation.
+  const forceMenusCss =
+    "<style>" +
+    "*,*::before,*::after{animation:none!important;transition:none!important;}" +
+    (showHiddenMenus
+      ? ".dropdown,.submenu,.flyout,.menu-panel,.nav-dropdown,.has-dropdown>ul," +
+        "[class*='dropdown-menu'],[data-dropdown],[role='menu'],[aria-haspopup='true']+ul," +
+        ".nav-item:hover .dropdown,.group:hover .dropdown" +
+        "{display:block!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important;}"
+      : "") +
+    "</style>";
 
   const hasHtml = /^<!doctype|^<html/i.test(trimmed);
   if (hasHtml) {
@@ -160,6 +215,10 @@ function extractBoxStyle(el, cs, rect, containerRect, tag, win) {
 
   const bg = cs.backgroundColor;
   const bgImage = cs.backgroundImage;
+  const bgImageUrls = extractBgImageUrls(bgImage);
+  const bgSize = cs.backgroundSize;
+  const bgRepeat = cs.backgroundRepeat;
+  const bgPosition = cs.backgroundPosition;
   const radii = {
     tl: parseFloat(cs.borderTopLeftRadius) || 0,
     tr: parseFloat(cs.borderTopRightRadius) || 0,
@@ -174,6 +233,11 @@ function extractBoxStyle(el, cs, rect, containerRect, tag, win) {
   };
   const opacity = parseFloat(cs.opacity);
   const boxShadow = cs.boxShadow;
+
+  const onclickTarget = parseOnclickTarget(el);
+  const href = el.getAttribute && el.getAttribute("href");
+  const isInteractive =
+    (tag === "button" || tag === "a") && (!!onclickTarget || (!!href && href !== "#" && !href.startsWith("javascript")));
 
   const hasBg = bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent";
   const hasBgImage = bgImage && bgImage !== "none";
@@ -255,7 +319,15 @@ function extractBoxStyle(el, cs, rect, containerRect, tag, win) {
     };
   }
 
-  if (!hasBg && !hasBgImage && !hasBorder && !hasShadow && !hasRadius && opacity === 1) {
+  if (
+    !hasBg &&
+    !hasBgImage &&
+    !hasBorder &&
+    !hasShadow &&
+    !hasRadius &&
+    opacity === 1 &&
+    !isInteractive
+  ) {
     return null;
   }
 
@@ -263,7 +335,18 @@ function extractBoxStyle(el, cs, rect, containerRect, tag, win) {
     type: "box",
     tag,
     x, y, w, h,
-    bg, bgImage, radii, border, opacity, boxShadow,
+    bg,
+    bgImage,
+    bgImageUrls,
+    bgSize,
+    bgRepeat,
+    bgPosition,
+    radii,
+    border,
+    opacity,
+    boxShadow,
+    onclickTarget,
+    href: href && href.startsWith("http") ? href : null,
   };
 }
 
@@ -277,6 +360,68 @@ async function loadImageBytes(atom) {
   } catch (e) {
     /* CORS / network failure - leave as placeholder */
   }
+}
+
+async function loadBgImageBytes(atom) {
+  if (!atom.bgImageUrls || !atom.bgImageUrls.length) return;
+  // Walk URLs in order; first one that loads wins (CSS allows layered images
+  // but the most common case is a single url()).
+  for (const url of atom.bgImageUrls) {
+    if (!url || url.startsWith("data:")) {
+      if (url && url.startsWith("data:")) {
+        const bytes = dataUrlToBytes(url);
+        if (bytes) {
+          atom.bgImageBytes = bytes;
+          atom.bgImageUrl = url;
+          return;
+        }
+      }
+      continue;
+    }
+    try {
+      const resp = await fetch(url, { mode: "cors" });
+      if (!resp.ok) continue;
+      const buf = await resp.arrayBuffer();
+      atom.bgImageBytes = new Uint8Array(buf);
+      atom.bgImageUrl = url;
+      return;
+    } catch (e) {
+      /* try next */
+    }
+  }
+}
+
+function dataUrlToBytes(dataUrl) {
+  const m = dataUrl.match(/^data:[^;]+;base64,(.*)$/);
+  if (!m) return null;
+  try {
+    const bin = atob(m[1]);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  } catch (e) {
+    return null;
+  }
+}
+
+function extractBgImageUrls(bgImage) {
+  if (!bgImage || bgImage === "none") return [];
+  const urls = [];
+  const re = /url\(\s*(?:"([^"]+)"|'([^']+)'|([^)]+?))\s*\)/g;
+  let m;
+  while ((m = re.exec(bgImage)) !== null) {
+    const u = (m[1] || m[2] || m[3] || "").trim();
+    if (u) urls.push(u);
+  }
+  return urls;
+}
+
+function parseOnclickTarget(el) {
+  if (!el || !el.getAttribute) return null;
+  const onclick = el.getAttribute("onclick") || "";
+  // Accept navigateTo('x'), navigateTo("x"), navigateTo('x', this), etc.
+  const m = onclick.match(/navigateTo\(\s*['"]([^'"]+)['"]/);
+  return m ? m[1] : null;
 }
 
 function collapseWhitespace(s) {

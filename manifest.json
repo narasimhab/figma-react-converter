@@ -1,0 +1,8 @@
+{
+  "name": "React To Figma",
+  "id": "react-to-figma-converter",
+  "api": "1.0.0", 
+  "main": "dist/code.js",
+  "ui": "dist/ui.html",
+  "editorType": ["figma"]
+}
